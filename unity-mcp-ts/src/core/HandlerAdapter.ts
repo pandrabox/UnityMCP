@@ -3,7 +3,7 @@ import { IResourceHandler } from "./interfaces/IResourceHandler.js";
 import { IPromptHandler } from "./interfaces/IPromptHandler.js";
 import { McpErrorCode } from "../types/ErrorCodes.js"
 import {McpServer, ResourceTemplate} from "@modelcontextprotocol/sdk/server/mcp.js";
-import {undefined} from "zod";
+import {undefined, z} from "zod";
 
 /**
  * Adapts various handler types to MCP SDK tools and resources.
@@ -165,18 +165,39 @@ export class HandlerAdapter {
 
         // Register each tool definition
         for (const [toolName, definition] of toolDefinitions.entries()) {
+            // Augment the parameter schema with an optional `target` field so
+            // callers can disambiguate across multiple Unity instances
+            // (design §3.2). The handler itself does not need to know about
+            // `target` — UnityConnection.sendRequest picks it up via
+            // params.target / opts.target on the caller side.
+            const augmentedSchema: Record<string, z.ZodType<any>> = {
+                ...definition.parameterSchema,
+                target: z
+                    .string()
+                    .optional()
+                    .describe(
+                        "Optional Unity project name or clientId to route this call to. " +
+                        "Required when multiple Unity instances are registered and no active client is set."
+                    ),
+            };
+
             this.server.tool(
                 toolName,
                 definition.description,
-                definition.parameterSchema,
-                definition.annotations || {},
-                async (params) => {
+                augmentedSchema,
+                async (params: any) => {
                     try {
                         // Extract the action from the tool name (e.g., "menu_execute" -> "execute")
                         const action = toolName.split('_')[1] || 'execute';
 
+                        // `target` is consumed by the routing layer
+                        // (BaseCommandHandler.sendUnityRequest extracts it and
+                        // forwards it as opts.target). We leave it in params so
+                        // it reaches sendUnityRequest; Unity Editor ignores
+                        // unknown keys in the command payload.
+
                         // Execute the command and await the result
-                        const result = await handler.execute(action, params);
+                        const result = await handler.execute(action, params ?? {});
 
                         if (result.success === false && result.error) {
                             return {

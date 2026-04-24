@@ -1,32 +1,133 @@
-﻿import * as net from 'net';
-import * as dgram from 'dgram';
 import { EventEmitter } from 'events';
 import { JObject } from '../types/index.js';
 import { McpErrorCode } from "../types/ErrorCodes.js";
+import {
+    retryableFetch,
+    RetryableFetchError,
+    Idempotency,
+} from './retryableFetch.js';
 
 /**
- * Handles TCP/IP communication between the TypeScript MCP server and Unity Editor.
- * Runs in server mode, accepting connections from multiple Unity clients.
+ * Builds the idempotency-cache lookup key for a request, matching the format
+ * emitted by the Unity Editor `/health.handlers[].name` field exactly.
+ *
+ * Rules (must stay in sync with McpHttpServer.BuildHealthResponse):
+ *  - `/command` with body `{command:"console.clear"}` → `/command:console.clear`
+ *  - `/play_mode` with body `{action:"step"}`        → `/play_mode:step`
+ *  - `/inspect`   with body `{mode:"write"}`          → `/inspect:write`
+ *  - Bare endpoint (no disambiguator) returns the endpoint as-is.
+ *
+ * The `endpoint` argument always starts with "/" (e.g. "/command").
+ */
+export function buildIdempotencyKey(
+    endpoint: string,
+    body?: Record<string, unknown> | null
+): string {
+    if (!body || typeof body !== 'object') return endpoint;
+
+    switch (endpoint) {
+        case '/command': {
+            const cmd = typeof body.command === 'string' ? body.command : '';
+            return cmd !== '' ? `${endpoint}:${cmd}` : endpoint;
+        }
+        case '/play_mode': {
+            const action = typeof body.action === 'string' ? body.action : '';
+            return action !== '' ? `${endpoint}:${action}` : endpoint;
+        }
+        case '/inspect': {
+            const mode = typeof body.mode === 'string' ? body.mode : '';
+            return mode !== '' ? `${endpoint}:${mode}` : endpoint;
+        }
+        default:
+            return endpoint;
+    }
+}
+
+export type UnityInstanceState = 'healthy' | 'reloading' | 'unhealthy';
+
+/**
+ * Information about a discovered Unity instance.
+ */
+export interface UnityInstance {
+    id: string;
+    projectName: string;
+    projectPath: string;
+    port: number;
+    unityVersion: string;
+    endpoint: string;
+    version: string;
+    /** state machine (design §3.4). */
+    state: UnityInstanceState;
+    /** Last time a success observation was made (/health 200 or UDP announce). */
+    lastSeen: number;
+    /** Last time ANY contact happened — used for unhealthyCooldown decisions. */
+    lastContact: number;
+    /** Consecutive poll failures (for debounce). */
+    consecutiveFailures: number;
+}
+
+/**
+ * Error codes used by resolveInstance.
+ */
+export const enum ResolveErrorCode {
+    NoInstance = 'no_instance',
+    TargetRequired = 'target_required',
+    TargetNotFound = 'target_not_found',
+    Unhealthy = 'unhealthy',
+}
+
+/**
+ * Error thrown when no Unity instance can be resolved.
+ */
+export class ResolveInstanceError extends Error {
+    public readonly code: string;
+    constructor(code: string, message: string) {
+        super(message);
+        this.name = 'ResolveInstanceError';
+        this.code = code;
+    }
+}
+
+/**
+ * Resolves a target name against a list of instances per design §3.2 step 1.
+ *   clientId exact > projectName exact (CI) > projectName substring (CI)
+ *
+ * Returns all matches. Callers decide single-match vs. ambiguous handling.
+ */
+export function matchInstancesByTarget(
+    instances: UnityInstance[],
+    target: string
+): UnityInstance[] {
+    // 1. clientId exact match.
+    const exactId = instances.filter(i => i.id === target);
+    if (exactId.length > 0) return exactId;
+
+    // 2. projectName exact, case-insensitive.
+    const lower = target.toLowerCase();
+    const exactName = instances.filter(
+        i => (i.projectName || '').toLowerCase() === lower
+    );
+    if (exactName.length > 0) return exactName;
+
+    // 3. projectName substring, case-insensitive.
+    return instances.filter(
+        i => (i.projectName || '').toLowerCase().includes(lower)
+    );
+}
+
+/**
+ * HTTP client for communicating with Unity Editor instances.
+ * Replaces the former TCP server architecture with fetch-based HTTP calls.
  */
 export class UnityConnection extends EventEmitter {
     private static instance: UnityConnection | null = null;
-    private server: net.Server | null = null;
-    private clients: Map<string, net.Socket> = new Map();
-    private activeClientId: string | null = null;
-    private port: number = 27182; // Default port
-    private host: string = '127.0.0.1';
-    private pendingRequests: Map<string, { resolve: (value: JObject) => void, reject: (reason: Error) => void }> = new Map();
-    private requestId: number = 0;
-    private clientDataBuffers: Map<string, string> = new Map();
-    private clientInfoMap: Map<string, any> = new Map();
 
-    // UDP broadcast related fields
-    private broadcastSocket: dgram.Socket | null = null;
-    private broadcastPort = 27183; // UDP broadcast port
+    private instances: Map<string, UnityInstance> = new Map();
+    private activeInstanceId: string | null = null;
+    private requestTimeoutMs: number = 30000;
+    /** Cache of command-name → idempotency class, populated from /health. */
+    private handlerIdempotencyCache: Map<string, Idempotency> = new Map();
 
-    /**
-     * Gets the singleton instance of the UnityConnection class.
-     */
     public static getInstance(): UnityConnection {
         if (!UnityConnection.instance) {
             UnityConnection.instance = new UnityConnection();
@@ -34,479 +135,434 @@ export class UnityConnection extends EventEmitter {
         return UnityConnection.instance;
     }
 
+    /** Test-only: resets the singleton. DO NOT USE in production code. */
+    public static resetInstanceForTesting(): void {
+        UnityConnection.instance = null;
+    }
+
     private constructor() {
         super();
-
-        // Error handler to prevent unhandled error events
         this.on('error', (err) => {
-            // Just log in debug mode but don't crash
             console.error(`[DEBUG] Error event caught: ${err.message}`);
         });
     }
 
-    /**
-     * Configures the server settings.
-     * @param host The host to bind to.
-     * @param port The port to bind to.
-     */
-    public configure(host: string, port: number): void {
-        this.host = host;
-        this.port = port;
-    }
+    // ──────────────────────────────────────────────
+    //  Instance Registry (called by ProjectRegistry)
+    // ──────────────────────────────────────────────
 
     /**
-     * Starts the server to accept Unity client connections.
-     * @returns A promise that resolves when the server is started.
+     * Registers or updates a Unity instance.
+     *
+     * NOTE: We DO NOT auto-select the first instance as active (design §3.2).
+     * `activeInstanceId` is only set when the user explicitly calls
+     * `unity_setActiveClient` or `unity_connectToProject`.
      */
-    public start(): Promise<void> {
-        return new Promise((resolve, reject) => {
-            try {
-                if (this.server) {
-                    console.error('[INFO] Server is already running');
-                    resolve();
-                    return;
-                }
+    public registerInstance(instance: UnityInstance): void {
+        const existing = this.instances.get(instance.id);
+        if (existing) {
+            // Merge: preserve state/lastSeen if the caller didn't supply new values.
+            this.instances.set(instance.id, { ...existing, ...instance });
+            return;
+        }
 
-                this.server = net.createServer((socket) => {
-                    // New client connection
-                    const clientId = `unity-${socket.remoteAddress}:${socket.remotePort}`;
-                    console.error(`[INFO] New Unity client connected: ${clientId}`);
-
-                    // Initialize buffer for this client
-                    this.clientDataBuffers.set(clientId, '');
-
-                    // Add client to the map
-                    this.clients.set(clientId, socket);
-
-                    // Set as active client if it's the first one
-                    if (!this.activeClientId) {
-                        this.activeClientId = clientId;
-                        console.error(`[INFO] Set ${clientId} as active client`);
-                    }
-
-                    // Emit connection event
-                    this.emit('clientConnected', {
-                        clientId,
-                        host: socket.remoteAddress,
-                        port: socket.remotePort
-                    });
-
-                    // Set up data handling
-                    socket.on('data', (data) => this.handleClientData(clientId, data));
-
-                    // Handle disconnection
-                    socket.on('close', () => {
-                        console.error(`[INFO] Unity client disconnected: ${clientId}`);
-                        this.clients.delete(clientId);
-                        this.clientDataBuffers.delete(clientId);
-                        this.clientInfoMap.delete(clientId);
-
-                        // Update active client if this was the active one
-                        if (this.activeClientId === clientId) {
-                            this.activeClientId = this.clients.size > 0 ?
-                                [...this.clients.keys()][0] : null;
-
-                            if (this.activeClientId) {
-                                console.error(`[INFO] New active client: ${this.activeClientId}`);
-                            }
-                        }
-
-                        this.emit('clientDisconnected', { clientId });
-                    });
-
-                    // Handle errors
-                    socket.on('error', (err) => {
-                        console.error(`[ERROR] Socket error for client ${clientId}: ${err.message}`);
-                        this.emit('clientError', { clientId, error: err });
-                    });
-                });
-
-                // Handle server errors
-                this.server.on('error', (err) => {
-                    console.error(`[ERROR] Server error: ${err.message}`);
-                    this.emit('error', err);
-                    reject(err);
-                });
-
-                // Start listening
-                this.server.listen(this.port, this.host, () => {
-                    console.error(`[INFO] MCP server listening on ${this.host}:${this.port}`);
-                    this.emit('serverStarted', { host: this.host, port: this.port });
-
-                    // Send a single broadcast when server starts
-                    this.sendInitialBroadcast("mcp_server_announce");
-
-                    resolve();
-                });
-            } catch (err) {
-                console.error(`[ERROR] Failed to start server: ${err instanceof Error ? err.message : String(err)}`);
-                reject(err);
-            }
+        this.instances.set(instance.id, instance);
+        console.error(
+            `[INFO] Unity instance registered: ${instance.id} ` +
+            `(${instance.projectName} on :${instance.port})`
+        );
+        this.emit('clientRegistered', {
+            clientId: instance.id,
+            info: {
+                productName: instance.projectName,
+                unityVersion: instance.unityVersion,
+                isEditor: true,
+                projectPathHash: instance.projectPath,
+            },
         });
     }
 
     /**
-     * Sends a single initial broadcast to announce the server
+     * Removes a Unity instance from the registry.
      */
-    sendInitialBroadcast(type: string): void {
-        try {
-            // Create UDP socket for a single broadcast
-            const socket = dgram.createSocket('udp4');
+    public removeInstance(id: string): void {
+        if (!this.instances.has(id)) return;
 
-            socket.on('error', (err) => {
-                console.error(`[ERROR] Broadcast socket error: ${err.message}`);
-                try {
-                    socket.close();
-                } catch (e) {
-                    // Ignore close errors
-                }
-            });
+        this.instances.delete(id);
+        console.error(`[INFO] Unity instance removed: ${id}`);
 
-            socket.bind(0, () => {
-                try {
-                    // Enable broadcasting
-                    socket.setBroadcast(true);
+        if (this.activeInstanceId === id) {
+            // Do NOT auto-pick another instance. Leave active unset (user must choose).
+            this.activeInstanceId = null;
+            this.emit('activeClientChanged', { clientId: null });
+        }
 
-                    // Create server info message
-                    const serverInfo = {
-                        type: type,
-                        host: this.host,
-                        port: this.port,
-                        version: "1.1.2",
-                        protocol: "unity-mcp",
-                        timestamp: Date.now()
-                    };
+        this.emit('clientDisconnected', { clientId: id });
+    }
 
-                    const message = Buffer.from(JSON.stringify(serverInfo));
-
-                    // Send the broadcast
-                    socket.send(
-                        message,
-                        0,
-                        message.length,
-                        this.broadcastPort,
-                        '255.255.255.255',
-                        (err) => {
-                            if (err) {
-                                console.error(`[ERROR] Broadcast failed: ${err instanceof Error ? err.message : String(err)}`);
-                            } else {
-                                console.error('[INFO] Initial MCP server broadcast sent');
-                            }
-
-                            // Close the socket after sending regardless of success/failure
-                            try {
-                                socket.close();
-                            } catch (e) {
-                                // Ignore close errors
-                            }
-                        }
-                    );
-                } catch (err) {
-                    console.error(`[ERROR] Failed to send broadcast: ${err instanceof Error ? err.message : String(err)}`);
-                    try {
-                        socket.close();
-                    } catch (e) {
-                        // Ignore close errors
-                    }
-                }
-            });
-        } catch (err) {
-            console.error(`[ERROR] Failed to create broadcast socket: ${err instanceof Error ? err.message : String(err)}`);
+    /**
+     * Updates the health state of an instance (used by ProjectRegistry).
+     */
+    public updateInstanceState(id: string, patch: Partial<UnityInstance>): void {
+        const instance = this.instances.get(id);
+        if (instance) {
+            Object.assign(instance, patch);
         }
     }
 
     /**
-     * Handles data received from a Unity client.
-     * @param clientId The client ID
-     * @param data The received data
+     * Returns a direct reference to a registered instance (or undefined).
+     * For internal use by ProjectRegistry / ProjectApi.
      */
-    private handleClientData(clientId: string, data: Buffer): void {
-        // Get the client's buffer
-        let buffer = this.clientDataBuffers.get(clientId) || '';
+    public getInstanceById(id: string): UnityInstance | undefined {
+        return this.instances.get(id);
+    }
 
-        // Add received data to buffer
-        buffer += data.toString('utf8');
-        this.clientDataBuffers.set(clientId, buffer);
+    /**
+     * Returns all registered instances regardless of state.
+     */
+    public getAllInstances(): UnityInstance[] {
+        return Array.from(this.instances.values());
+    }
 
-        // Process complete messages by newline delimiter
-        let endIndex: number;
-        while ((endIndex = buffer.indexOf('\n')) !== -1) {
-            // Extract a complete message
-            const message = buffer.substring(0, endIndex).trim();
-            // Remove the processed message from the buffer
-            buffer = buffer.substring(endIndex + 1);
-            this.clientDataBuffers.set(clientId, buffer);
+    /**
+     * Cache of handler → idempotency, populated from /health `handlers[]`.
+     */
+    public setHandlerIdempotency(cache: Map<string, Idempotency>): void {
+        this.handlerIdempotencyCache = cache;
+    }
 
-            // Process the message
-            this.processClientMessage(clientId, message);
+    public mergeHandlerIdempotency(entries: Iterable<[string, Idempotency]>): void {
+        for (const [name, idem] of entries) {
+            this.handlerIdempotencyCache.set(name, idem);
+        }
+    }
+
+    /**
+     * Looks up a cache entry by the canonical key (as produced by
+     * {@link buildIdempotencyKey}, matching Editor `/health.handlers[].name`).
+     * Unknown keys fall back to `unsafe` (conservative default).
+     */
+    public getHandlerIdempotency(cacheKey: string): Idempotency {
+        return this.handlerIdempotencyCache.get(cacheKey) ?? 'unsafe';
+    }
+
+    // ──────────────────────────────────────────────
+    //  target resolution (design §3.2)
+    // ──────────────────────────────────────────────
+
+    /**
+     * Resolves a target per design §3.2:
+     *
+     *   1. target explicit → clientId exact > projectName exact (CI) > substring (CI)
+     *      Failure → ResolveInstanceError(target_not_found)
+     *   2. target omitted + activeInstanceId set → return active if state ∈ {healthy,reloading}
+     *   3. target omitted + active not set + exactly 1 instance → use it
+     *   4. target omitted + active not set + 0 instances → ResolveInstanceError(no_instance)
+     *   5. target omitted + active not set + multiple instances →
+     *        ResolveInstanceError(target_required, hint about unity_listClients)
+     */
+    public resolveInstance(target?: string): UnityInstance {
+        const all = Array.from(this.instances.values());
+
+        if (target !== undefined && target !== null && target !== '') {
+            const matches = matchInstancesByTarget(all, target);
+            if (matches.length === 0) {
+                throw new ResolveInstanceError(
+                    ResolveErrorCode.TargetNotFound,
+                    `No Unity instance matches target "${target}"`
+                );
+            }
+            // Pick first match. Ambiguity at MCP-tool level is tolerated
+            // (first-hit); /proxy has stricter semantics via its own resolver.
+            return matches[0];
         }
 
-        // Check if there's data in the buffer that might be a complete message without newline
-        if (buffer.length > 0) {
+        // target omitted
+        if (this.activeInstanceId) {
+            const active = this.instances.get(this.activeInstanceId);
+            if (active && (active.state === 'healthy' || active.state === 'reloading')) {
+                return active;
+            }
+            // active was set but instance went away / unhealthy — fall through
+            // to the 0/1/multiple logic below.
+        }
+
+        const usable = all.filter(
+            i => i.state === 'healthy' || i.state === 'reloading'
+        );
+        if (usable.length === 0) {
+            throw new ResolveInstanceError(
+                ResolveErrorCode.NoInstance,
+                'No Unity instances are currently registered'
+            );
+        }
+        if (usable.length === 1) {
+            return usable[0];
+        }
+        throw new ResolveInstanceError(
+            ResolveErrorCode.TargetRequired,
+            'Multiple Unity instances are registered but no target was specified. ' +
+            'Call unity_listClients to see options, then pass `target` or ' +
+            'call unity_setActiveClient.'
+        );
+    }
+
+    // ──────────────────────────────────────────────
+    //  sendRequest / sendToEndpoint with retry (design §3.1)
+    // ──────────────────────────────────────────────
+
+    /**
+     * Shared core transport used by both `sendRequest` (/command wrapper) and
+     * `sendToEndpoint` (direct endpoint POST). Handles target resolution,
+     * idempotency cache lookup, retry, and envelope unwrap.
+     *
+     * @param path           absolute path on the Unity instance (e.g. "/command", "/execute_code")
+     * @param bodyForKey     body object used to derive the idempotency cache key via buildIdempotencyKey
+     * @param payload        the actual JSON body to POST (already shaped per endpoint contract)
+     * @param opts           optional overrides (target, retry budget, idempotency)
+     */
+    private async _sendCore(
+        path: string,
+        bodyForKey: Record<string, unknown> | null,
+        payload: unknown,
+        opts?: {
+            target?: string;
+            retryMaxMs?: number;
+            idempotency?: Idempotency;
+        }
+    ): Promise<JObject> {
+        const retryMaxMs =
+            opts?.retryMaxMs
+            ?? parseInt(process.env.MCP_RELOAD_RETRY_MAX_MS ?? '15000', 10)
+            ?? 15000;
+
+        const instance = this.resolveInstance(opts?.target);
+
+        // Idempotency cache key must match Editor `/health.handlers[].name`
+        // format exactly (e.g. `/command:<command.action>`, `/execute_code`).
+        const cacheKey = buildIdempotencyKey(path, bodyForKey ?? undefined);
+        const idempotency: Idempotency =
+            opts?.idempotency
+            ?? this.getHandlerIdempotency(cacheKey);
+
+        const body = JSON.stringify(payload);
+
+        try {
+            const { response } = await retryableFetch(
+                `${instance.endpoint}${path}`,
+                {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body,
+                },
+                {
+                    idempotency,
+                    retryMaxMs,
+                    perAttemptTimeoutMs: this.requestTimeoutMs,
+                }
+            );
+
+            let parsed: any;
             try {
-                // Try to parse as JSON to see if it's complete
-                JSON.parse(buffer);
-
-                // If we reach here, it's valid JSON, so process it
-                const message = buffer.trim();
-                this.clientDataBuffers.set(clientId, '');
-                this.processClientMessage(clientId, message);
-            } catch (err) {
-                // Not complete JSON, keep waiting for more data
-            }
-        }
-    }
-
-    /**
-     * Processes a complete message from a Unity client.
-     * @param clientId The client ID
-     * @param message The message to process
-     */
-    private processClientMessage(clientId: string, message: string): void {
-        if (!message) {
-            return;
-        }
-
-        try {
-            console.error(`[DEBUG] Processing message from ${clientId}: ${message}`);
-            const response = JSON.parse(message) as JObject;
-
-            // Handle registration message
-            if (response.type === "registration") {
-                this.handleRegistration(clientId, response);
-                return;
+                parsed = await response.json();
+            } catch {
+                throw new Error(
+                    `Unity returned invalid JSON on ${path} (${response.status})`
+                );
             }
 
-            // Handle success response with result and ID
-            if (response.status === "success" && response.result && response.id) {
-                const id = response.id as string;
-                const result = response.result as JObject;
-
-                // Resolve pending request
-                if (this.pendingRequests.has(id)) {
-                    const { resolve } = this.pendingRequests.get(id)!;
-                    this.pendingRequests.delete(id);
-                    resolve(result);
+            // Unified envelope: { status: 'success'|'error', result, error }
+            if (parsed && typeof parsed === 'object') {
+                if (parsed.status === 'success' && parsed.result !== undefined) {
+                    return parsed.result as JObject;
+                }
+                if (parsed.status === 'error') {
+                    const err = parsed.error ?? {};
+                    const msg = err.message ?? err.m ?? 'Unity returned error';
+                    const e = new Error(msg);
+                    (e as any).code = err.code ?? McpErrorCode.InternalError;
+                    throw e;
                 }
             }
-            // Handle regular response with just an ID
-            else if (response.id) {
-                const id = response.id as string;
 
-                // Resolve pending request
-                if (this.pendingRequests.has(id)) {
-                    const { resolve } = this.pendingRequests.get(id)!;
-                    this.pendingRequests.delete(id);
-                    resolve(response);
-                }
-            }
-            // Handle push notification or event from Unity
-            else {
-                this.emit('message', { clientId, message: response });
-            }
+            // Legacy / fall-through — return as-is.
+            return parsed as JObject;
         } catch (err) {
-            console.error(`[ERROR] Failed to parse message from ${clientId}: ${err instanceof Error ? err.message : String(err)}`);
+            if (err instanceof RetryableFetchError) {
+                const e = new Error(err.message);
+                (e as any).code = err.code;
+                (e as any).cause = err.cause;
+                throw e;
+            }
+            throw err;
         }
     }
 
     /**
-     * Handles a client registration message
-     * @param clientId The temporary client ID
-     * @param message The registration message
+     * Sends a command request to Unity via HTTP, with retry per design §3.1.
+     *
+     * @param request  JObject with at least `command`; may include `type`, `params`.
+     * @param opts     Optional target override, retry budget, idempotency override.
      */
-    private handleRegistration(clientId: string, message: JObject): void {
-        // Get registration info
-        const newClientId = message.clientId as string;
-        const clientInfo = message.clientInfo;
-
-        // Get existing socket
-        const socket = this.clients.get(clientId);
-        if (!socket) return;
-
-        // Update from temporary ID to persistent ID
-        this.clients.delete(clientId);
-        this.clients.set(newClientId, socket);
-
-        // Update buffer too
-        const buffer = this.clientDataBuffers.get(clientId) || '';
-        this.clientDataBuffers.delete(clientId);
-        this.clientDataBuffers.set(newClientId, buffer);
-
-        // Store client info
-        this.clientInfoMap.set(newClientId, clientInfo);
-
-        // Log with minimal information (privacy-focused)
-        console.error(`[INFO] Unity project registered: ${newClientId} (${(clientInfo as any)?.productName || 'Unknown'})`);
-
-        // Update active client if needed
-        if (this.activeClientId === clientId) {
-            this.activeClientId = newClientId;
+    public async sendRequest(
+        request: JObject,
+        opts?: {
+            target?: string;
+            retryMaxMs?: number;
+            idempotency?: Idempotency;
         }
+    ): Promise<JObject> {
+        const command = (request.command as string | undefined) ?? '';
 
-        // Emit registration event
-        this.emit('clientRegistered', { clientId: newClientId, info: clientInfo });
+        const payload = {
+            command,
+            type: request.type ?? '',
+            params: request.params,
+        };
+
+        return this._sendCore('/command', { command }, payload, opts);
     }
 
     /**
-     * Lists all connected Unity clients.
-     * @returns An array of client information
+     * Sends a direct POST to an absolute endpoint on a Unity instance
+     * (e.g. `/execute_code`, `/capture_screenshot`). Unlike `sendRequest`,
+     * the body is forwarded verbatim — no `{command, type, params}` wrapping.
+     *
+     * Idempotency cache lookup key uses {@link buildIdempotencyKey}(endpoint, body)
+     * so handlers registered under `/health.handlers[].name` with matching
+     * keys resolve correctly. Retry + error classification are identical to
+     * `sendRequest` (both share `_sendCore`).
+     *
+     * @param endpoint Absolute path starting with "/" (e.g. "/execute_code").
+     * @param body     JSON body to POST (forwarded as-is).
+     * @param opts     Optional target override, retry budget, idempotency override.
      */
-    public getConnectedClients(): Array<{ id: string, isActive: boolean, info: any }> {
-        return Array.from(this.clients.keys()).map(id => ({
-            id,
-            isActive: id === this.activeClientId,
-            info: this.clientInfoMap.get(id) || {}
-        }));
+    public async sendToEndpoint(
+        endpoint: string,
+        body: JObject,
+        opts?: {
+            target?: string;
+            retryMaxMs?: number;
+            idempotency?: Idempotency;
+        }
+    ): Promise<JObject> {
+        return this._sendCore(endpoint, body as Record<string, unknown>, body, opts);
+    }
+
+    // ──────────────────────────────────────────────
+    //  Public API (preserved for handler compatibility)
+    // ──────────────────────────────────────────────
+
+    /**
+     * Checks if any Unity instances are connected and healthy-or-reloading.
+     */
+    public isUnityConnected(): boolean {
+        return this.getUsableInstances().length > 0;
     }
 
     /**
-     * Clears all connected Unity clients.
+     * Ensures there is at least one usable (healthy or reloading) instance.
+     */
+    public async ensureConnected(): Promise<void> {
+        if (this.getUsableInstances().length === 0) {
+            const error = new Error('No Unity clients connected');
+            (error as any).code = McpErrorCode.ConnectionError;
+            throw error;
+        }
+    }
+
+    /**
+     * Checks if there are any registered instances.
+     */
+    public hasConnectedClients(): boolean {
+        return this.instances.size > 0;
+    }
+
+    /**
+     * Lists all usable Unity instances (healthy + reloading).
+     * Unhealthy instances are excluded.
+     */
+    public getConnectedClients(): Array<{
+        id: string;
+        isActive: boolean;
+        state: UnityInstanceState;
+        info: any;
+    }> {
+        return Array.from(this.instances.values())
+            .filter(i => i.state === 'healthy' || i.state === 'reloading')
+            .map(instance => ({
+                id: instance.id,
+                isActive: instance.id === this.activeInstanceId,
+                state: instance.state,
+                info: {
+                    productName: instance.projectName,
+                    unityVersion: instance.unityVersion,
+                    isEditor: true,
+                    projectPathHash: instance.projectPath,
+                    port: instance.port,
+                    endpoint: instance.endpoint,
+                    state: instance.state,
+                },
+            }));
+    }
+
+    /**
+     * Clears all registered instances.
      */
     public clearClients(): void {
-        // Clear all client data
-        this.clients.clear();
-        this.clientDataBuffers.clear();
-        this.clientInfoMap.clear();
+        this.instances.clear();
+        this.activeInstanceId = null;
     }
 
     /**
-     * Sets the active Unity client.
-     * @param clientId The ID of the client to set as active
-     * @returns True if successful, false if the client doesn't exist
+     * Sets the active Unity instance by id. Returns false if the id is unknown.
      */
     public setActiveClient(clientId: string): boolean {
-        if (!this.clients.has(clientId)) {
+        if (!this.instances.has(clientId)) {
             return false;
         }
-
-        this.activeClientId = clientId;
-        console.error(`[INFO] Active client set to: ${clientId}`);
+        this.activeInstanceId = clientId;
+        console.error(`[INFO] Active instance set to: ${clientId}`);
         this.emit('activeClientChanged', { clientId });
         return true;
     }
 
     /**
-     * Gets the active client ID.
-     * @returns The active client ID, or null if no connections
+     * Sets the active client by looking up a target (clientId or projectName).
+     * Returns the resolved instance on success, null on failure.
+     */
+    public setActiveClientByTarget(target: string): UnityInstance | null {
+        const matches = matchInstancesByTarget(Array.from(this.instances.values()), target);
+        if (matches.length === 0) return null;
+        const picked = matches[0];
+        this.activeInstanceId = picked.id;
+        console.error(`[INFO] Active instance set to: ${picked.id} (target="${target}")`);
+        this.emit('activeClientChanged', { clientId: picked.id });
+        return picked;
+    }
+
+    /**
+     * Gets the active instance ID.
      */
     public getActiveClientId(): string | null {
-        return this.activeClientId;
+        return this.activeInstanceId;
     }
 
     /**
-     * Checks if there are any connected Unity clients.
-     * @returns True if at least one client is connected
-     */
-    public hasConnectedClients(): boolean {
-        return this.clients.size > 0;
-    }
-
-    /**
-     * Sends a request to the active Unity client and waits for a response.
-     * @param request The request object to send
-     * @returns A Promise that resolves with the response
-     */
-    public async sendRequest(request: JObject): Promise<JObject> {
-        if (!this.hasConnectedClients() || !this.activeClientId) {
-            const error = new Error('No Unity clients connected');
-            (error as any).code = McpErrorCode.ConnectionError;
-            throw error;
-        }
-
-        return new Promise((resolve, reject) => {
-            try {
-                // Add request ID for tracking
-                const id = (++this.requestId).toString();
-                const requestWithId: JObject = {
-                    command: request.command,
-                    type: request.type || '',
-                    params: request.params,
-                    id
-                };
-
-                console.error(`[DEBUG] Sending request to ${this.activeClientId}: ${JSON.stringify(requestWithId)}`);
-
-                // Store the promise callbacks
-                this.pendingRequests.set(id, { resolve, reject });
-
-                // Get the active client socket
-                const socket = this.clients.get(this.activeClientId as string)!;
-
-                // Send the request
-                const data = JSON.stringify(requestWithId) + '\n';
-                socket.write(data, (err) => {
-                    if (err) {
-                        console.error(`[ERROR] Failed to send data to Unity: ${err.message}`);
-                        this.pendingRequests.delete(id);
-                        reject(err);
-                    }
-                });
-
-                // Set timeout to prevent hanging requests
-                setTimeout(() => {
-                    if (this.pendingRequests.has(id)) {
-                        console.error(`[ERROR] Request with ID ${id} timed out`);
-                        this.pendingRequests.delete(id);
-                        reject(new Error('Request timed out'));
-                    }
-                }, 30000); // 30 seconds timeout
-            } catch (err) {
-                console.error(`[ERROR] Error sending request: ${err instanceof Error ? err.message : String(err)}`);
-                reject(err);
-            }
-        });
-    }
-
-    /**
-     * Checks if connected to any Unity client.
-     * @returns True if connected, false otherwise
-     */
-    public isUnityConnected(): boolean {
-        return this.hasConnectedClients();
-    }
-
-    /**
-     * Ensures that there is an active connection to Unity, returning an error if not.
-     * @returns A promise that resolves when connected or rejects if no connection
-     */
-    public async ensureConnected(): Promise<void> {
-        if (!this.hasConnectedClients()) {
-            const error = new Error('No Unity clients connected');
-            (error as any).code = McpErrorCode.ConnectionError;
-            throw error;
-        }
-
-        return Promise.resolve();
-    }
-
-    /**
-     * Stops the server and closes all connections.
+     * Stops the connection (no-op for HTTP client, kept for API compatibility).
      */
     public stop(): void {
-        // Close all client connections
-        for (const [clientId, socket] of this.clients.entries()) {
-            console.error(`[INFO] Closing connection to client: ${clientId}`);
-            socket.destroy();
-        }
+        this.clearClients();
+        this.emit('serverStopped');
+    }
 
-        this.clients.clear();
-        this.clientDataBuffers.clear();
-        this.clientInfoMap.clear();
-        this.activeClientId = null;
+    // ──────────────────────────────────────────────
+    //  Internal Helpers
+    // ──────────────────────────────────────────────
 
-        // Close the server
-        if (this.server) {
-            this.server.close(() => {
-                console.error(`[INFO] Server stopped`);
-                this.emit('serverStopped');
-            });
-            this.server = null;
-        }
-
-        // Reject all pending requests
-        for (const [id, { reject }] of this.pendingRequests) {
-            reject(new Error('Connection closed'));
-            this.pendingRequests.delete(id);
-        }
+    private getUsableInstances(): UnityInstance[] {
+        return Array.from(this.instances.values())
+            .filter(i => i.state === 'healthy' || i.state === 'reloading');
     }
 }

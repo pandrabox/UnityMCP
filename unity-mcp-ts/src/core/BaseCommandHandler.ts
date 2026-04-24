@@ -104,10 +104,29 @@ export abstract class BaseCommandHandler implements ICommandHandler {
     protected async sendUnityRequest(command: string, parameters: JObject): Promise<JObject> {
         await this.ensureUnityConnection();
 
+        // Extract the optional `target` routing hint injected by HandlerAdapter.
+        // The handler params are forwarded to Unity verbatim (minus target).
+        const params: JObject = {};
+        let target: string | undefined;
+        if (parameters) {
+            for (const key of Object.keys(parameters)) {
+                if (key === 'target') {
+                    const v = (parameters as any)[key];
+                    if (typeof v === 'string' && v !== '') target = v;
+                } else {
+                    params[key] = (parameters as any)[key];
+                }
+            }
+        }
+        const opts = target ? { target } : undefined;
+
         // Explicit non-null assertion since we've checked in ensureUnityConnection
-        return this.unityConnection!.sendRequest({
-            command,
-            params: parameters
-        });
+        return this.unityConnection!.sendRequest(
+            {
+                command,
+                params
+            },
+            opts
+        );
     }
 }

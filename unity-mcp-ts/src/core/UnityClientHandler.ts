@@ -1,40 +1,23 @@
-﻿import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { UnityConnection } from "./UnityConnection.js";
 
 /**
  * Registers Unity client management tools with the MCP server.
- * These tools allow for listing, selecting, and managing connected Unity clients.
+ * These tools allow listing, selecting, and managing connected Unity instances.
  */
 export function registerUnityClientTools(server: McpServer): void {
-    // Get the Unity connection instance
     const connection = UnityConnection.getInstance();
 
-    // List all connected Unity clients
+    // List all connected Unity instances
     server.tool(
         "unity_listClients",
         "Lists all connected Unity projects",
         {},
         async () => {
-
-            connection.clearClients();
-
-            connection.sendInitialBroadcast("listClients");
-
-            // Wait for the clients
-            await new Promise(resolve => setTimeout(resolve, 3000));
-
             const clients = connection.getConnectedClients();
 
-            // Filter out clients with invalid/unknown information
-            const validClients = clients.filter(client => {
-                const info = client.info || {};
-                // Consider a client valid if it has a valid project name
-                return info.productName && info.productName !== "Unknown" &&
-                    info.productName !== "UnknownProject";
-            });
-
-            if (validClients.length === 0) {
+            if (clients.length === 0) {
                 return {
                     content: [{
                         type: "text",
@@ -43,111 +26,115 @@ export function registerUnityClientTools(server: McpServer): void {
                 };
             }
 
-            // Focus on project information in the display
-            let responseText = "Connected Unity projects:\n\n";
-
-            validClients.forEach((client, index) => {
+            const activeId = connection.getActiveClientId();
+            const lines: string[] = ["Connected Unity projects:", ""];
+            clients.forEach((client, index) => {
                 const info = client.info || {};
-                responseText += `${index + 1}. ${client.isActive ? '✓ ' : ''}${info.productName || 'Unknown Project'}\n`;
-                responseText += `   ID: ${client.id}\n`;
-                responseText += `   Unity: ${info.unityVersion || 'Unknown'}\n`;
-                responseText += `   Mode: ${info.isEditor ? 'Editor' : 'Player'}\n`;
-                responseText += `   Project Hash: ${info.projectPathHash || 'Unknown'}\n`;
-                responseText += '\n';
+                const isActive = client.isActive || client.id === activeId;
+                lines.push(
+                    `${index + 1}. ${isActive ? '> ' : '  '}` +
+                    `${info.productName || 'Unknown Project'} [${client.state}]`
+                );
+                lines.push(`   clientId: ${client.id}`);
+                lines.push(`   unity:    ${info.unityVersion || 'Unknown'}`);
+                lines.push(`   endpoint: ${info.endpoint || 'Unknown'}`);
+                lines.push('');
             });
+
+            // Machine-readable JSON summary appended so callers can parse.
+            const summary = {
+                activeClientId: activeId,
+                clients: clients.map(c => ({
+                    clientId: c.id,
+                    isActive: c.isActive || c.id === activeId,
+                    state: c.state,
+                    projectName: c.info?.productName,
+                    unityVersion: c.info?.unityVersion,
+                    endpoint: c.info?.endpoint,
+                    port: c.info?.port,
+                })),
+            };
+            lines.push("---");
+            lines.push(JSON.stringify(summary));
 
             return {
                 content: [{
                     type: "text",
-                    text: responseText
+                    text: lines.join('\n')
                 }]
             };
         }
     );
 
-    // Set active client by ID
+    // Set active client by clientId or projectName
     server.tool(
         "unity_setActiveClient",
-        "Sets the active Unity project",
+        "Sets the active Unity project. Accepts either a clientId or a projectName " +
+        "(exact or substring, case-insensitive).",
         {
-            clientId: z.string().describe("The ID of the client to set as active")
+            clientId: z
+                .string()
+                .optional()
+                .describe("The clientId (exact) of the client to activate."),
+            projectName: z
+                .string()
+                .optional()
+                .describe("A project name (exact or substring, case-insensitive).")
         },
         async (params) => {
-            const success = connection.setActiveClient(params.clientId);
-
-            if (!success) {
+            const target = params.clientId ?? params.projectName;
+            if (!target) {
                 return {
                     isError: true,
                     content: [{
                         type: "text",
-                        text: `Error: Client with ID ${params.clientId} not found`
+                        text: "Error: one of `clientId` or `projectName` is required."
                     }]
                 };
             }
 
-            const clients = connection.getConnectedClients();
-            const activeClient = clients.find(c => c.id === params.clientId);
-            const info = activeClient?.info || {};
+            const picked = connection.setActiveClientByTarget(target);
+            if (!picked) {
+                return {
+                    isError: true,
+                    content: [{
+                        type: "text",
+                        text: `Error: no Unity instance matches "${target}"`
+                    }]
+                };
+            }
 
             return {
                 content: [{
                     type: "text",
-                    text: `Successfully set ${info.productName || params.clientId} as the active project`
+                    text: `Active client set to ${picked.projectName} (clientId=${picked.id}, endpoint=${picked.endpoint})`
                 }]
             };
         }
     );
 
-    // Connect to project by name
+    // Connect to project by name (alias of setActiveClient with projectName).
     server.tool(
         "unity_connectToProject",
-        "Connect to a Unity project by name",
+        "Connect to a Unity project by name (alias of unity_setActiveClient with projectName).",
         {
             projectName: z.string().describe("The name of the Unity project to connect to")
         },
         async (params) => {
-            const clients = connection.getConnectedClients();
-
-            // Filter for valid clients first, then search by name
-            const validClients = clients.filter(client => {
-                const info = client.info || {};
-                return info.productName && info.productName !== "Unknown" &&
-                    info.productName !== "UnknownProject";
-            });
-
-            // Search for clients by project name
-            const matchingClients = validClients.filter(c =>
-                (c.info?.productName || "").toLowerCase().includes(params.projectName.toLowerCase())
-            );
-
-            if (matchingClients.length === 0) {
+            const picked = connection.setActiveClientByTarget(params.projectName);
+            if (!picked) {
                 return {
                     isError: true,
                     content: [{
                         type: "text",
-                        text: `Error: No projects found matching "${params.projectName}"`
+                        text: `Error: no projects found matching "${params.projectName}"`
                     }]
                 };
             }
-
-            // Select the first matching client
-            const client = matchingClients[0];
-            const success = connection.setActiveClient(client.id);
-
-            if (!success) {
-                return {
-                    isError: true,
-                    content: [{
-                        type: "text",
-                        text: `Error: Failed to connect to project "${params.projectName}"`
-                    }]
-                };
-            }
-
             return {
                 content: [{
                     type: "text",
-                    text: `Successfully connected to "${client.info?.productName}" (${client.info?.isEditor ? 'Editor' : 'Player'})`
+                    text: `Successfully connected to "${picked.projectName}" (${picked.endpoint})`
                 }]
             };
         }
@@ -185,34 +172,26 @@ export function registerUnityClientTools(server: McpServer): void {
                 return {
                     content: [{
                         type: "text",
-                        text: "Active client information not found. This is unexpected and may indicate an internal error."
+                        text: "Active client information not found."
                     }]
                 };
             }
 
             const info = activeClient.info || {};
-
-            // Check if this is a valid client with proper information
-            if (!info.productName || info.productName === "Unknown" || info.productName === "UnknownProject") {
-                return {
-                    content: [{
-                        type: "text",
-                        text: "The active client has incomplete information and may not be properly initialized."
-                    }]
-                };
-            }
-
-            // Format active client info with focus on project information
-            let responseText = "Active Unity project:\n\n";
-            responseText += `Project: ${info.productName}\n`;
-            responseText += `Unity Version: ${info.unityVersion || 'Unknown'}\n`;
-            responseText += `Mode: ${info.isEditor ? 'Editor' : 'Player'}\n`;
-            responseText += `Project Hash: ${info.projectPathHash || 'Unknown'}\n`;
+            const lines = [
+                "Active Unity project:",
+                "",
+                `Project:       ${info.productName}`,
+                `State:         ${activeClient.state}`,
+                `Unity Version: ${info.unityVersion || 'Unknown'}`,
+                `Endpoint:      ${info.endpoint || 'Unknown'}`,
+                `clientId:      ${activeClient.id}`,
+            ];
 
             return {
                 content: [{
                     type: "text",
-                    text: responseText
+                    text: lines.join('\n')
                 }]
             };
         }
