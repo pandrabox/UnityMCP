@@ -1,8 +1,11 @@
-﻿using System;
-using System.Linq;
+using System;
+using System.Collections.Generic;
 using System.Reflection;
+
 using UnityEngine;
 using Newtonsoft.Json.Linq;
+
+using UnityMCP.Editor.Core;
 
 namespace UnityMCP.Editor.Resources
 {
@@ -28,42 +31,44 @@ namespace UnityMCP.Editor.Resources
 
         /// <summary>
         /// Fetches assembly information with the provided parameters.
+        /// Supports limit, offset, and fields for pagination and field filtering.
         /// </summary>
-        /// <param name="parameters">Resource parameters as a JObject.</param>
-        /// <returns>A JSON object containing assembly information.</returns>
         public JObject FetchResource(JObject parameters)
         {
             try
             {
-                // Get filtering options from parameters
                 var includeSystemAssemblies = parameters?["includeSystemAssemblies"]?.Value<bool>() ?? false;
                 var includeUnityAssemblies = parameters?["includeUnityAssemblies"]?.Value<bool>() ?? true;
                 var includeProjectAssemblies = parameters?["includeProjectAssemblies"]?.Value<bool>() ?? true;
+                var limit = parameters?["limit"]?.Value<int>() ?? int.MaxValue;
+                var offset = parameters?["offset"]?.Value<int>() ?? 0;
+                var fieldsFilter = ListResponseBuilder.ParseFieldsParam(parameters?["fields"]?.ToString());
 
-                // Get assemblies
                 var assemblies = AppDomain.CurrentDomain.GetAssemblies();
-                var filteredAssemblies = assemblies.Where(a =>
-                    (includeSystemAssemblies || !this.IsSystemAssembly(a)) &&
-                    (includeUnityAssemblies || !this.IsUnityAssembly(a)) &&
-                    (includeProjectAssemblies || !this.IsProjectAssembly(a))
-                );
 
-                // Convert to JSON
-                var assembliesArray = new JArray();
-                foreach (var assembly in filteredAssemblies)
+                var filtered = new List<Assembly>();
+                foreach (var a in assemblies)
                 {
-                    if (assembly.IsDynamic)
-                    {
-                        continue; // Skip dynamic assemblies
-                    }
-                    assembliesArray.Add(this.CreateAssemblyObject(assembly));
+                    if (a.IsDynamic) continue;
+                    if (!includeSystemAssemblies && this.IsSystemAssembly(a)) continue;
+                    if (!includeUnityAssemblies && this.IsUnityAssembly(a)) continue;
+                    if (!includeProjectAssemblies && this.IsProjectAssembly(a)) continue;
+                    filtered.Add(a);
                 }
+
+                var page = ListResponseBuilder.Build(
+                    filtered,
+                    offset,
+                    limit,
+                    a => this.CreateAssemblyObject(a),
+                    fieldsFilter);
 
                 return new JObject
                 {
-                    ["success"] = true,
-                    ["assemblies"] = assembliesArray,
-                    ["count"] = assembliesArray.Count
+                    ["assemblies"] = page["items"],
+                    ["count"] = filtered.Count,
+                    ["truncated"] = page["truncated"],
+                    ["next"] = page["next"]
                 };
             }
             catch (Exception ex)
@@ -71,82 +76,30 @@ namespace UnityMCP.Editor.Resources
                 Debug.LogError($"Error retrieving assemblies: {ex.Message}");
                 return new JObject
                 {
-                    ["success"] = false,
                     ["error"] = $"Error retrieving assemblies: {ex.Message}"
                 };
             }
         }
 
-        /// <summary>
-        /// Creates a JSON object with assembly information.
-        /// </summary>
-        /// <param name="assembly">The assembly to describe.</param>
-        /// <returns>A JObject containing formatted assembly data.</returns>
         private JObject CreateAssemblyObject(Assembly assembly)
         {
             var assemblyName = assembly.GetName();
-            var result = new JObject
+            return new JObject
             {
                 ["name"] = assemblyName.Name,
                 ["fullName"] = assembly.FullName,
                 ["version"] = assemblyName.Version?.ToString(),
-                // ["location"] = string.IsNullOrEmpty(assembly.Location) ? null : assembly.Location,
-                // ["codeBase"] = assemblyName.CodeBase,
                 ["assemblyType"] = this.GetAssemblyType(assembly)
             };
-
-            // Add referenced assemblies
-            // var referencedAssemblies = new JArray();
-            // foreach (var referencedAssembly in assembly.GetReferencedAssemblies())
-            // {
-            //     referencedAssemblies.Add(new JObject
-            //     {
-            //         ["name"] = referencedAssembly.Name,
-            //         ["version"] = referencedAssembly.Version.ToString()
-            //     });
-            // }
-            // result["referencedAssemblies"] = referencedAssemblies;
-
-            // Add types count
-            // try
-            // {
-            //     result["typesCount"] = assembly.GetTypes().Length;
-            // }
-            // catch
-            // {
-            //     // Some assemblies might throw exceptions when getting types
-            //     result["typesCount"] = -1;
-            // }
-
-            return result;
         }
 
-        /// <summary>
-        /// Determines the type of an assembly (System, Unity, or Project).
-        /// </summary>
-        /// <param name="assembly">The assembly to check.</param>
-        /// <returns>A string describing the assembly type.</returns>
         private string GetAssemblyType(Assembly assembly)
         {
-            if (this.IsSystemAssembly(assembly))
-            {
-                return "System";
-            }
-            else if (this.IsUnityAssembly(assembly))
-            {
-                return "Unity";
-            }
-            else
-            {
-                return "Project";
-            }
+            if (this.IsSystemAssembly(assembly)) return "System";
+            if (this.IsUnityAssembly(assembly)) return "Unity";
+            return "Project";
         }
 
-        /// <summary>
-        /// Checks if an assembly is a system assembly.
-        /// </summary>
-        /// <param name="assembly">The assembly to check.</param>
-        /// <returns>True if the assembly is a system assembly, false otherwise.</returns>
         private bool IsSystemAssembly(Assembly assembly)
         {
             var name = assembly.GetName().Name;
@@ -157,11 +110,6 @@ namespace UnityMCP.Editor.Resources
                    name.StartsWith("Mono.");
         }
 
-        /// <summary>
-        /// Checks if an assembly is a Unity assembly.
-        /// </summary>
-        /// <param name="assembly">The assembly to check.</param>
-        /// <returns>True if the assembly is a Unity assembly, false otherwise.</returns>
         private bool IsUnityAssembly(Assembly assembly)
         {
             var name = assembly.GetName().Name;
@@ -170,11 +118,6 @@ namespace UnityMCP.Editor.Resources
                    name.StartsWith("UnityEditor");
         }
 
-        /// <summary>
-        /// Checks if an assembly is a project assembly.
-        /// </summary>
-        /// <param name="assembly">The assembly to check.</param>
-        /// <returns>True if the assembly is a project assembly, false otherwise.</returns>
         private bool IsProjectAssembly(Assembly assembly)
         {
             return !this.IsSystemAssembly(assembly) && !this.IsUnityAssembly(assembly);

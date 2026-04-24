@@ -1,0 +1,20 @@
+# Orchestra pipeline state (per-session, not shared)
+.orchestra/
+
+# Crash dumps / debug artifacts
+*.stackdump
+
+# IDE
+.idea/
+.vs/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Unity build artifacts (shouldn't appear in package repo but be safe)
+Library/
+Temp/
+Logs/
+UserSettings/

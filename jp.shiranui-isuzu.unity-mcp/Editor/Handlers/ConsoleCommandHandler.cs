@@ -1,7 +1,10 @@
 ﻿using System;
+using System.Collections.Generic;
 using System.Reflection;
+
 using Newtonsoft.Json.Linq;
 using UnityEngine;
+
 using UnityMCP.Editor.Core;
 
 namespace UnityMCP.Editor.Handlers
@@ -69,6 +72,24 @@ namespace UnityMCP.Editor.Handlers
         /// Gets the description of this command handler.
         /// </summary>
         public string Description => "Access and manage Unity Console logs";
+
+        /// <summary>
+        /// Gets the idempotency classification. Unsafe is the conservative class-level
+        /// default; per-action granularity is declared via <see cref="Actions"/>.
+        /// </summary>
+        public McpIdempotency Idempotency => McpIdempotency.Unsafe;
+
+        /// <summary>
+        /// Per-action idempotency: console.getLogs / getCount are read-only (Safe),
+        /// while clear / setFilter mutate Editor state (Unsafe).
+        /// </summary>
+        public IReadOnlyList<McpHandlerAction> Actions { get; } = new[]
+        {
+            new McpHandlerAction("getLogs",   McpIdempotency.Safe),
+            new McpHandlerAction("getCount",  McpIdempotency.Safe),
+            new McpHandlerAction("clear",     McpIdempotency.Unsafe),
+            new McpHandlerAction("setFilter", McpIdempotency.Unsafe)
+        };
 
         /// <summary>
         /// Executes the command with the given parameters.
