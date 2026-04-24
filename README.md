@@ -1,158 +1,191 @@
 # Unity MCP 統合フレームワーク
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-![Unity](https://img.shields.io/badge/Unity-2022.3.22--Unity6.1-black.svg)
+![Version](https://img.shields.io/badge/version-2.1.0-brightgreen)
+![Unity](https://img.shields.io/badge/Unity-2022.3%E2%80%93Unity6.1-black.svg)
 ![.NET](https://img.shields.io/badge/.NET-C%23_9.0-purple.svg)
 ![GitHub Stars](https://img.shields.io/github/stars/isuzu-shiranui/UnityMCP?style=social)
 
 [English Version](./README.en.md)
 
-Unity と Model Context Protocol (MCP) を統合するための拡張可能なフレームワークです。このフレームワークにより、Claude などの AI 言語モデルがスケーラブルなハンドラーアーキテクチャを通じて Unity エディタと直接対話することができます。
+Unity Editor と Model Context Protocol (MCP) を統合する拡張フレームワークです。Claude などの AI 言語モデル、または CLI (curl) から、HTTP 経由で Unity Editor を直接操作できます。
 
-## 🌟 特徴
+## 🌟 特徴 (v2.1)
 
-- **拡張可能なプラグインアーキテクチャ**: カスタムハンドラーを作成・登録して機能を拡張
-- **完全なMCP統合**: コマンド・リソース・プロンプトの全MCP基本機能をサポート
-- **TypeScript & C# サポート**: サーバーコンポーネントは TypeScript、Unity コンポーネントは C#
-- **エディタ統合**: カスタマイズ可能な設定を持つエディタツールとして動作
-- **自動検出**: 各種ハンドラーの自動検出と登録
-- **通信**: Unity と外部 AI サービス間の TCP/IP ベースの通信
+- **HTTP + UDP アーキテクチャ**: 各 Unity Editor が HTTP サーバを持ち、UDP ブロードキャストで自動 discovery
+- **MCP と HTTP の両方をサポート**: Claude Desktop / Claude Code からは MCP tool 経由、スクリプト / CI からは curl 直叩き
+- **マルチ Editor 対応**: 複数 Unity Editor を同時起動しても `target` パラメータ or プロキシで名前指定ルーティング
+- **ドメインリロード耐性**: `SessionState` で port を永続化し、リロード跨ぎで同 port を自動再バインド
+- **Editor パネルキャプチャ** *(Windows)*: Inspector / Hierarchy / Project / Console などの任意 EditorWindow をスクリーンショット
+- **built-in コード実行**: HTTP `/execute_code` と MCP tool `unity_execute_code` が標準装備 (Roslyn 使用)
+- **拡張可能なプラグインアーキテクチャ**: `IMcpCommandHandler` / `IMcpResourceHandler` / `BasePromptHandler` を実装すればリフレクションで自動登録
+- **統一レスポンスエンベロープ**: `{status, result?, error?, truncated?, next?}` で成功/エラー/ページングを一貫した形で返す
+- **コンテキスト経済**: `limit` / `offset` / `fields` / `detail` パラメータでレスポンスを絞り込み可能
+- **冪等性分類**: `Safe` / `Unsafe` を per-action で宣言し、TS 側が `err.cause.code` を見て再送可否を制御 (副作用操作の二重実行を構造的に排除)
 
 ## 📋 必要条件
 
-- Unity 2022.3.22f1 以上（Unity6.1 にも対応）
-   - 2022.3.22f1, 2023.2.19f1, 6000.0.35f1, 6000.1.0f1で動作確認
-- .NET/C# 9.0
-- Node.js 18.0.0 以上と npm（TypeScript サーバー用）
-   - [Node.js 公式サイト](https://nodejs.org/)からインストールしてください
+- Unity 2022.3 以上 (Unity 6000 系対応)
+  - 2022.3.22f1、2023.2.19f1、6000.0.35f1、6000.1.17f1 で動作確認
+- .NET / C# 9.0
+- Node.js 18.0.0 以上 (TypeScript MCP サーバ用)
+  - [Node.js 公式サイト](https://nodejs.org/) から入手
 
 ## 🚀 はじめに
 
 ### インストール方法
 
-1. Unity パッケージマネージャーを使用してインストール:
-   - パッケージマネージャーを開く (Window > Package Manager)
-   - 「+」ボタンをクリック
-   - 「Add package from git URL...」を選択
-   - 入力: `https://github.com/isuzu-shiranui/UnityMCP.git?path=jp.shiranui-isuzu.unity-mcp`
+Unity パッケージマネージャからインストール:
+
+1. Window > Package Manager を開く
+2. 「+」 → 「Add package from git URL...」
+3. `https://github.com/isuzu-shiranui/UnityMCP.git?path=jp.shiranui-isuzu.unity-mcp` を入力
 
 ### クイックセットアップ
 
-1. Unity を開き、Edit > Preferences > Unity MCP に移動
-2. 接続設定 (ホストとポート) を構成
-3. 「Connect」ボタンをクリックして接続の待ち受けを開始
+1. Unity Editor を起動すると、`McpEditorInitializer` が自動的に HTTP サーバを立ち上げます (127.0.0.1:27182、27182-27199 でフォールバック)
+2. Edit > Preferences > Unity MCP で設定を確認
+3. `curl http://127.0.0.1:27182/health` で動作確認
 
-### Claude Desktop との連携
+### Claude Desktop / Claude Code との連携
 
 #### インストーラーを使う場合
 
-Unity MCPにはTypeScriptクライアントの簡単なインストールと設定のためのツールが含まれています。
+1. Unity Editor で Edit > Preferences > Unity MCP を開く
+2. 「Open Installer Window」をクリック
+3. インストーラーの指示に従い、Node.js の存在確認後、TypeScript クライアントをダウンロード
+4. 「Configuration Preview」セクションの JSON をクリップボードへコピー
+5. Claude Desktop の Settings > Developer > Edit Config で貼り付けて保存
+6. Claude Desktop を再起動
 
-1. Unityエディタで、「Edit > Preferences > Unity MCP」に移動します
-2. 「Open Installer Window」ボタンをクリックしてTypeScriptクライアントインストーラーを開きます
-3. インストーラーの指示に従って操作します：
-   - Node.jsがインストールされていることを確認します（インストールされていない場合はダウンロードリンクが表示されます）
-   - 最新バージョンを取得するには「Latest」ボタンをクリックします
-   - インストール先フォルダを選択し、「Download and Install TypeScript Client」ボタンをクリックします
-   - インストールが完了したら、「Configuration Preview」セクションを開いて設定JSONをクリップボードにコピーします
-4. Claude Desktopの設定を行います：
-   - Claude Desktopを開きます
-   - 「Claude」メニューをクリックし、「Settings...」を選択します
-   - 「Developer」タブをクリックし、「Edit Config」ボタンをクリックします
-   - コピーした設定を貼り付けて保存します
-5. Claude Desktopを再起動すると設定が適用されます
-
-これで、Claude Desktopが自動的にUnity MCPクライアントに接続し、Unity Editorとのシームレスな連携が可能になります。
+> 💡 **macOS 利用者へ**: v2.1 で Homebrew 経由の Node (`/opt/homebrew/bin/node`、`/usr/local/bin/node`) の検出に対応しました。Finder から起動した Unity が PATH を継承しない環境でも動作します (#7)。
 
 #### 手動でインストールする場合
 
-1. リリースページから最新のZIPファイルをダウンロードして解凍します
-2. `build/index.js` ファイルのフルパスを控えておきます
-3. Claude Desktop の設定ファイル `claude_desktop_config.json` を開きます
-4. 以下の内容を追加して保存します:
+1. `unity-mcp-ts` リポジトリをクローン or リリース ZIP を取得
+2. `npm install && npm run build` を実行して `build/index.js` を生成
+3. Claude Desktop の `claude_desktop_config.json` に追加:
 
 ```json
 {
-   "mcpServers": {
-      "unity-mcp": {
-         "command": "node",
-         "args": [
-            "path/to/index.js"
-         ]
-      }
-   }
+  "mcpServers": {
+    "unity-mcp": {
+      "command": "node",
+      "args": ["/absolute/path/to/unity-mcp-ts/build/index.js"]
+    }
+  }
 }
 ```
-※ `path/to/index.js` は実際のパスに置き換えてください（Windowsの場合はバックスラッシュをエスケープ"\\\\"するか、フォワードスラッシュ"/"を使用）
 
-## 🔌 アーキテクチャ
+Windows ではパスのバックスラッシュをエスケープ (`\\`) するか、フォワードスラッシュを使ってください。
 
-Unity MCP フレームワークは主に 2 つのコンポーネントで構成されています:
+### CLI (curl) でも使える
 
-### 1. Unity C# プラグイン
+TypeScript サーバ不要で、HTTP 直叩きから操作可能:
 
-- **McpServer**: TCP 接続をリッスンしコマンドをルーティングするコアサーバー
-- **IMcpCommandHandler**: カスタムコマンドハンドラーを作成するためのインターフェース
-- **IMcpResourceHandler**: データ提供リソースを作成するためのインターフェース
-- **McpSettings**: プラグイン設定を管理
-- **McpServiceManager**: サービス管理のための依存性注入システム
-- **McpHandlerDiscovery**: 各種ハンドラーを自動検出して登録
+```bash
+# ヘルスチェック
+curl http://127.0.0.1:27182/health
 
-### 2. TypeScript MCP クライアント
+# C# コード実行
+curl -X POST http://127.0.0.1:27182/execute_code \
+  -H "Content-Type: application/json" \
+  -d '{"code":"return GameObject.FindObjectsByType<Transform>(FindObjectsSortMode.None).Length;"}'
 
-- **HandlerAdapter**: 各種ハンドラーを MCP SDK に適応させる
-- **HandlerDiscovery**: ハンドラー実装の検出と登録
-- **UnityConnection**: Unity との TCP/IP 通信を管理
-- **BaseCommandHandler**: コマンドハンドラー実装のベースクラス
-- **BaseResourceHandler**: リソースハンドラー実装のベースクラス
-- **BasePromptHandler**: プロンプトハンドラー実装のベースクラス
+# Inspector のスクショ (Windows)
+curl -X POST http://127.0.0.1:27182/capture_screenshot \
+  -H "Content-Type: application/json" \
+  -d '{"view":"inspector","maxSize":1024}'
+```
+
+マルチ Editor 用にプロキシ経由の例:
+
+```bash
+# 複数 Unity が起動中なら TS サーバの :27180 で discover
+curl http://127.0.0.1:27180/projects
+
+# プロジェクト名指定でリクエスト転送
+curl -X POST http://127.0.0.1:27180/proxy/MyProject/health
+```
+
+Skill として `~/.claude/skills/unity-mcp/` に curl ワークフロー集を同梱しています。
+
+## 🔌 アーキテクチャ (v2.1)
+
+```
+MCP client (Claude)
+    │ stdio (MCP protocol)
+    ▼
+unity-mcp-ts (Node)
+    ├── HandlerAdapter / HandlerDiscovery  (MCP tools / prompts / resources)
+    ├── UnityConnection                     (HTTP fetch + retryableFetch)
+    │       ├── sendRequest(cmd, params)    → POST /command
+    │       └── sendToEndpoint(path, body)  → POST <path>  (e.g. /execute_code)
+    ├── ProjectRegistry                     (UDP :27183, state machine)
+    └── ProjectApi :27180-27189             (/projects, /proxy/:name/*)
+            │ HTTP
+            ▼
+Unity Editor(s) — McpHttpServer :27182-27199
+    ├── HttpListener + main-thread execution queue
+    ├── Built-in shortcuts + plugin handlers
+    └── UDP broadcast (27183) every 30s
+```
+
+### Unity C# プラグイン
+
+- **McpHttpServer**: HTTP リスナー + UDP ブロードキャスタ + メインスレッド実行キュー
+- **IMcpCommandHandler** / **IMcpResourceHandler**: プラグイン拡張用インターフェース (Idempotency 付き)
+- **McpIdempotency**: `Safe` / `Unsafe` enum
+- **ListResponseBuilder**: `limit` / `offset` / `fields` を処理する共通ユーティリティ
+- **McpEditorInitializer**: `InitializeOnLoad` + `AssemblyReloadEvents` で SessionState 経由 port 復元
+- **McpHandlerDiscovery**: リフレクションでハンドラー自動登録
+
+### TypeScript MCP サーバ
+
+- **HandlerAdapter**: MCP SDK に tools / prompts / resources を登録
+- **HandlerDiscovery**: `src/handlers/` を走査して `ICommandHandler` / `IPromptHandler` / `IResourceHandler` を自動登録
+- **UnityConnection**: HTTP クライアント (retry + idempotency + target 解決)
+- **ProjectRegistry**: UDP 受信 + 3 値ステートマシン (healthy / reloading / unhealthy)
+- **ProjectApi**: 27180-27189 の `/projects` + `/proxy/:name/*`
+- **retryableFetch**: `err.cause.code` ベースで Unsafe は pre-handshake のみリトライ
 
 ## 📄 MCP ハンドラータイプ
 
-Unity MCPでは、Model Context Protocol (MCP) に基づく以下の3種類のハンドラータイプをサポートしています:
+| 種別 | 用途 | MCP 制御 | 実装インターフェース |
+|---|---|---|---|
+| Tools (Command) | アクション実行 | モデル制御 | `IMcpCommandHandler` (C#) / `BaseCommandHandler` (TS) |
+| Resources | データ提供 | アプリ制御 | `IMcpResourceHandler` (C#) / `BaseResourceHandler` (TS) |
+| Prompts | テンプレ / ワークフロー | ユーザ制御 | `BasePromptHandler` (TS のみ) |
 
-### 1. コマンドハンドラー（Tools）
+## 📚 組み込みハンドラー
 
-- **用途**: アクションを実行するためのツール（Unity側で何かを実行させる）
-- **制御**: モデル制御型 - AIモデルが自動的に呼び出せる
-- **実装**: IMcpCommandHandler インターフェースを実装
+### HTTP エンドポイント (Editor 側、built-in)
 
-### 2. リソースハンドラー（Resources）
+| Endpoint | Idempotency | 概要 |
+|---|---|---|
+| `GET /health` | Safe | バージョン、ハンドラー一覧、稼働時間 |
+| `POST /execute_code` | Unsafe | Roslyn で C# を動的コンパイル・実行 |
+| `POST /browse_hierarchy` | Safe | シーン階層をフィルタ付きで取得 (limit/offset/fields 対応) |
+| `POST /inspect` | read/list: Safe、write: Unsafe | GameObject / Component のプロパティ読み書き |
+| `POST /capture_screenshot` | Safe | Game / Scene / Editor パネル (inspector / hierarchy / project / console / `window:<title>`) のキャプチャ |
+| `POST /read_logs` | Safe | Console ログを取得 (limit/offset/fields/type) |
+| `POST /play_mode` | status: Safe、他: Unsafe | Play Mode 制御 (status/play/stop/pause/unpause/step) |
+| `GET /resource` | Safe | assemblies / packages 情報 |
+| `POST /command` | per-command | プラグイン系 (`menu.execute`、`console.*`) |
 
-- **用途**: Unity内のデータにアクセスするためのリソース（情報提供）
-- **制御**: アプリケーション制御型 - クライアントアプリが使用を決定
-- **実装**: IMcpResourceHandler インターフェースを実装
+### MCP tools (TS 側、built-in)
 
-### 3. プロンプトハンドラー（Prompts）
+`unity_listClients`、`unity_setActiveClient`、`unity_connectToProject`、`unity_getActiveClient`、`unity_execute_code`、`console_getLogs`、`console_getCount`、`console_clear`、`console_setFilter`、`menu_execute`
 
-- **用途**: 再利用可能なプロンプトテンプレートやワークフロー
-- **制御**: ユーザー制御型 - ユーザーが明示的に選択して使用
-- **実装**: IPromptHandler インターフェースを実装（TypeScript側のみ）
+### MCP prompts (TS 側、built-in)
 
-## 🔬 サンプルコード
+- `code_execute`: `unity_execute_code` 用の C# コードテンプレート
 
-パッケージには以下のサンプルが含まれています：
-
-1. **Unity MCP Handler Samples**
-   - C#実装のサンプルコード
-   - そのままプロジェクトにインポートして使用可能
-
-2. **Unity MCP Handler Samples JavaScript**
-   - JavaScript実装のサンプルコード
-   - この中のJSファイルは`build/handlers`ディレクトリにコピーして使用してください
-
-> ⚠️ **注意**: サンプルコードには任意コード実行機能が含まれています。本番環境での使用には十分注意してください。
-
-サンプルのインポート方法:
-1. Unity パッケージマネージャーで本パッケージを選択
-2. 「Samples」タブをクリック
-3. 必要なサンプルの「Import」ボタンをクリック
+すべての tool / endpoint は任意で `target` パラメータ (projectName or clientId) を受け、複数 Editor 環境でルーティングを明示できます。
 
 ## 🛠️ カスタムハンドラーの作成
 
 ### コマンドハンドラー (C#)
-
-`IMcpCommandHandler` を実装する新しいクラスを作成:
 
 ```csharp
 using Newtonsoft.Json.Linq;
@@ -164,63 +197,16 @@ namespace YourNamespace.Handlers
     {
         public string CommandPrefix => "yourprefix";
         public string Description => "ハンドラーの説明";
+        public McpIdempotency Idempotency => McpIdempotency.Safe; // Unsafe なら明示
 
         public JObject Execute(string action, JObject parameters)
         {
-            // コマンドロジックを実装
             if (action == "yourAction")
             {
-                // パラメータを使って何かを実行
-                return new JObject
-                {
-                    ["success"] = true,
-                    ["result"] = "結果データ"
-                };
+                return new JObject { ["result"] = "..." };
             }
-
-            return new JObject
-            {
-                ["success"] = false,
-                ["error"] = $"不明なアクション: {action}"
-            };
-        }
-    }
-}
-```
-
-### リソースハンドラー (C#)
-
-`IMcpResourceHandler` を実装する新しいクラスを作成:
-
-```csharp
-using Newtonsoft.Json.Linq;
-using UnityMCP.Editor.Resources;
-
-namespace YourNamespace.Resources
-{
-    internal sealed class YourResourceHandler : IMcpResourceHandler
-    {
-        public string ResourceName => "yourresource";
-        public string Description => "リソースの説明";
-        public string ResourceUri => "unity://yourresource";
-
-        public JObject FetchResource(JObject parameters)
-        {
-            // リソースデータを取得する処理を実装
-            var data = new JArray();
-            
-            // 何かデータを取得・加工してJArrayに追加
-            data.Add(new JObject
-            {
-                ["name"] = "項目1",
-                ["value"] = "値1"
-            });
-
-            return new JObject
-            {
-                ["success"] = true,
-                ["items"] = data
-            };
+            // エンベロープ側で自動的に error envelope に promote される
+            return new JObject { ["error"] = $"Unknown action: {action}" };
         }
     }
 }
@@ -228,214 +214,118 @@ namespace YourNamespace.Resources
 
 ### コマンドハンドラー (TypeScript)
 
-`BaseCommandHandler` を拡張して新しいハンドラーを作成:
-
 ```typescript
+import { BaseCommandHandler } from "../core/BaseCommandHandler.js";
 import { IMcpToolDefinition } from "../core/interfaces/ICommandHandler.js";
 import { JObject } from "../types/index.js";
 import { z } from "zod";
-import { BaseCommandHandler } from "../core/BaseCommandHandler.js";
 
 export class YourCommandHandler extends BaseCommandHandler {
-   public get commandPrefix(): string {
-      return "yourprefix";
-   }
+    public get commandPrefix(): string { return "yourprefix"; }
+    public get description(): string { return "ハンドラーの説明"; }
 
-   public get description(): string {
-      return "ハンドラーの説明";
-   }
+    public getToolDefinitions(): Map<string, IMcpToolDefinition> {
+        const tools = new Map();
+        tools.set("yourprefix_yourAction", {
+            description: "アクションの説明",
+            parameterSchema: { param1: z.string() }
+        });
+        return tools;
+    }
 
-   public getToolDefinitions(): Map<string, IMcpToolDefinition> {
-      const tools = new Map<string, IMcpToolDefinition>();
-
-      // ツールを定義
-      tools.set("yourprefix_yourAction", {
-         description: "アクションの説明",
-         parameterSchema: {
-            param1: z.string().describe("パラメータの説明"),
-            param2: z.number().optional().describe("オプションパラメータ")
-         },
-         annotations: {
-            title: "ツールのタイトル",
-            readOnlyHint: true,
-            openWorldHint: false
-         }
-      });
-
-      return tools;
-   }
-
-   protected async executeCommand(action: string, parameters: JObject): Promise<JObject> {
-      // コマンドロジックを実装
-      // リクエストを Unity に転送
-      return await this.sendUnityRequest(
-              `${this.commandPrefix}.${action}`,
-              parameters
-      );
-   }
-}
-```
-
-### リソースハンドラー (TypeScript)
-
-`BaseResourceHandler` を拡張して新しいリソースハンドラーを作成:
-
-```typescript
-import { BaseResourceHandler } from "../core/BaseResourceHandler.js";
-import { JObject } from "../types/index.js";
-import { URL } from "url";
-
-export class YourResourceHandler extends BaseResourceHandler {
-   public get resourceName(): string {
-      return "yourresource";
-   }
-
-   public get description(): string {
-      return "リソースの説明";
-   }
-
-   public get resourceUriTemplate(): string {
-      return "unity://yourresource";
-   }
-
-   protected async fetchResourceData(uri: URL, parameters?: JObject): Promise<JObject> {
-      // リクエストパラメータを処理
-      const param1 = parameters?.param1 as string;
-
-      // Unityにリクエストを送信
-      const response = await this.sendUnityRequest("yourresource.get", {
-         param1: param1
-      });
-
-      if (!response.success) {
-         throw new Error(response.error as string || "リソース取得に失敗しました");
-      }
-
-      // 応答データを整形して返す
-      return {
-         items: response.items || []
-      };
-   }
+    protected async executeCommand(action: string, parameters: JObject): Promise<JObject> {
+        return this.sendUnityRequest(`${this.commandPrefix}.${action}`, parameters);
+    }
 }
 ```
 
 ### プロンプトハンドラー (TypeScript)
 
-`BasePromptHandler` を拡張して新しいプロンプトハンドラーを作成:
-
 ```typescript
 import { BasePromptHandler } from "../core/BasePromptHandler.js";
 import { IMcpPromptDefinition } from "../core/interfaces/IPromptHandler.js";
-import { z } from "zod";
 
 export class YourPromptHandler extends BasePromptHandler {
-   public get promptName(): string {
-      return "yourprompt";
-   }
+    public get promptName(): string { return "yourprompt"; }
+    public get description(): string { return "プロンプトの説明"; }
 
-   public get description(): string {
-      return "プロンプトの説明";
-   }
-
-   public getPromptDefinitions(): Map<string, IMcpPromptDefinition> {
-      const prompts = new Map<string, IMcpPromptDefinition>();
-
-      // プロンプト定義を登録
-      prompts.set("analyze-component", {
-         description: "Unityコンポーネントを分析する",
-         template: "以下のUnityコンポーネントを詳細に分析し、改善点を提案してください:\n\n```csharp\n{code}\n```",
-         additionalProperties: {
-            code: z.string().describe("分析対象のC#コード")
-         }
-      });
-
-      return prompts;
-   }
+    public getPromptDefinitions(): Map<string, IMcpPromptDefinition> {
+        const prompts = new Map();
+        prompts.set("your-template", {
+            description: "テンプレートの説明",
+            template: "以下のコードを分析してください:\n{code}"
+        });
+        return prompts;
+    }
 }
 ```
 
-**注意**: C#側の`IMcpCommandHandler`または`IMcpResourceHandler`を実装したクラスはプロジェクト内のどこに配置しても、アセンブリ検索によって自動的に検出・登録されます。TypeScript側も同様に`handlers`ディレクトリに配置することで自動検出されます。
-
-## 🔄 通信フロー
-
-1. Claude (または他の AI) がMCPのいずれかの機能（ツール/リソース/プロンプト）を呼び出す
-2. TypeScript サーバーが TCP 経由で Unity にリクエストを転送
-3. Unity の McpServer がリクエストを受信し、適切なハンドラーを見つける
-4. ハンドラーが Unity のメインスレッドでリクエストを処理
-5. 結果が TCP 接続を通じて TypeScript サーバーに戻される
-6. TypeScript サーバーが結果をフォーマットして Claude に返す
+> 💡 C# ハンドラーはプロジェクト内のどこに置いても `McpHandlerDiscovery` が自動検出します。TS は `unity-mcp-ts/src/handlers/` に置けば `HandlerDiscovery` が自動登録します。
 
 ## ⚙️ 設定
 
-### Unity 設定
+### Unity Editor 設定
 
-Edit > Preferences > Unity MCP から設定にアクセス:
+Edit > Preferences > Unity MCP:
 
-- **Host**: サーバーをバインドする IP アドレス (デフォルト: 127.0.0.1)
-- **Port**: リッスンするポート (デフォルト: 27182)
-- **UDP Discovery**: TypeScriptサーバーの自動検出を有効化
-- **Auto-start on Launch**: Unity 起動時に自動的にサーバーを開始
-- **Auto-restart on Play Mode Change**: プレイモードの開始/終了時にサーバーを再起動
-- **Detailed Logs**: デバッグ用の詳細ログを有効化
+- **HTTP Port**: サーバ開始ポート (既定 27182、27182-27199 で先着フォールバック)
+- **Auto-start on Launch**: Editor 起動時に自動開始
+- **UDP Discovery**: UDP ブロードキャスト (ポート 27183、既定 30 秒間隔) の有効化
+- **Broadcast Interval**: UDP 送信間隔
+- **Port Persistence**: ドメインリロード跨ぎで同じ port を維持
+- **Reload Retry Max MS**: TS/CLI 側のリトライ上限のヒント
+- **Detailed Logs**: デバッグログの出力切替
+- **Handler / Resource Enabled States**: ハンドラーごとの有効化トグル
 
-### TypeScript 設定
+> ⚠️ v2.1 で **`Auto-restart on Play Mode Change` を削除**しました。Play Mode 遷移はドメインリロードを伴う場合のみ server を Stop/Start し、`AssemblyReloadEvents` 経由で自動復元します。
 
-TypeScript サーバーの環境変数:
+### TypeScript サーバ環境変数
 
-- `MCP_HOST`: Unity サーバーホスト (デフォルト: 127.0.0.1)
-- `MCP_PORT`: Unity サーバーポート (デフォルト: 27182)
+| Variable | 既定 | 説明 |
+|---|---|---|
+| `MCP_RELOAD_RETRY_MAX_MS` | 15000 | ドメインリロード中の再試行時間上限 (ms) |
+| `MCP_UNHEALTHY_COOLDOWN_MS` | 60000 | reloading → unhealthy への昇格までの猶予 |
+| `MCP_PROJECT_API_PORT` | 27180 | ProjectApi 開始ポート (27180-27189 フォールバック) |
+| `MCP_UDP_PORT` | 27183 | UDP announce 受信ポート |
+| `MCP_HEALTH_INTERVAL` | 10000 | ヘルスポーリング間隔 (ms) |
+
+## 🧪 テスト
+
+- **Unity (EditMode)**: `Editor/Tests/` — 23 ケース (ListResponseBuilder / Envelope / Idempotency / ScreenshotCapture)
+- **TS (Jest)**: `unity-mcp-ts/src/__tests__/` — 68 ケース (UnityConnection / ProjectRegistry / ProjectApi / retry / cache)
+
+```bash
+cd unity-mcp-ts
+npm test    # Jest 68/68 pass 期待
+```
 
 ## 🔍 トラブルシューティング
 
-### 一般的な問題
+| 症状 | 対応 |
+|---|---|
+| `/health` に接続できない | Unity Editor が起動しているか、MCP パッケージが import されているか、27182-27199 のいずれかが listen しているか確認 |
+| `target_required` エラー | 複数 Unity 起動中 + `target` 未指定。`unity_setActiveClient` か `target` パラメータで明示 |
+| ドメインリロード後に切れる | v2.1 では自動再バインド。`SessionState` が機能していない場合は Unity ログ確認 |
+| C# ハンドラーが登録されない | Editor アセンブリで internal/public、`IMcpCommandHandler` 実装、コンパイルエラー無しを確認 |
+| Node が検出されない (Mac) | v2.1 で Homebrew パスにフォールバック対応。最新版を利用 (#7) |
 
-1. **接続エラー**
-   - Unity側のファイアウォール設定を確認
-   - ポート番号が正しく設定されているか確認
-   - 別のプロセスが同じポートを使用していないか確認
+詳細なエラーコードは `unity-mcp-ts/README.md` または [Skill api-reference.md](~/.claude/skills/unity-mcp/references/api-reference.md) 参照。
 
-2. **ハンドラーが登録されない**
-   - ハンドラークラスが正しいインターフェースを実装しているか確認
-   - C#ハンドラーがpublicまたはinternalアクセスレベルか確認
-   - Unity側でログを確認し登録プロセスでエラーが発生していないか確認
+## 🔒 セキュリティ
 
-3. **リソースが見つからない**
-   - リソース名とURIが一致しているか確認
-   - リソースハンドラーが正しく有効化されているか確認
-
-### ログの確認
-
-- Unity Console: McpServerからのログメッセージを確認
-- TypeScriptサーバー: コンソール出力でMCP Inspectorなどを用いて通信エラーを確認
-
-## 📚 組み込みハンドラー
-
-### Unity (C#)
-
-- **MenuItemCommandHandler**: Unity エディタのメニュー項目を実行
-- **ConsoleCommandHandler**: Unity コンソールログ操作
-- **AssembliesResourceHandler**: アセンブリ情報の取得
-- **PackagesResourceHandler**: パッケージ情報の取得
-
-### TypeScript
-
-- **MenuItemCommandHandler**: メニュー項目実行
-- **ConsoleCommandHandler**: コンソールログ操作
-- **AssemblyResourceHandler**: アセンブリ情報の取得
-- **PackageResourceHandler**: パッケージ情報の取得
+- **`/execute_code` は任意の C# を実行できます**。不特定多数がアクセスできる環境では McpSettings から無効化するか、listener を loopback のみに制限してください (v2.x は既定で 127.0.0.1 のみ bind)。
+- **外部ネットワーク非公開**: HTTP/UDP すべて loopback 限定。LAN 公開はサポート外です。
 
 ## 📖 外部リソース
 
 - [Model Context Protocol (MCP) 仕様](https://modelcontextprotocol.io/introduction)
-
-## ⚠️ セキュリティに関する注意
-
-1. **信頼できないハンドラーを実行しない**: 第三者が作成したハンドラーコードは、事前にセキュリティレビューを行ってから使用してください。
-2. **コード実行権限を制限**: 特に`code_execute`コマンドを含むハンドラーは任意コード実行可能なため、運用環境では無効化を検討してください。
+- [unity-mcp-ts README](./unity-mcp-ts/README.md) (TS サーバ詳細)
+- [Unity パッケージ README](./jp.shiranui-isuzu.unity-mcp/README.md) (Editor 側詳細)
+- [CHANGELOG](./jp.shiranui-isuzu.unity-mcp/CHANGELOG.md)
 
 ## 📄 ライセンス
 
-このプロジェクトは MIT ライセンスの下で提供されています - 詳細はライセンスファイルを参照してください。
+MIT License — 詳細はリポジトリのライセンスファイルを参照。
 
 ---
 
