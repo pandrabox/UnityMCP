@@ -1,158 +1,191 @@
 # Unity MCP Integration Framework
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-![Unity](https://img.shields.io/badge/Unity-2022.3.22--Unity6.1-black.svg)
+![Version](https://img.shields.io/badge/version-2.1.0-brightgreen)
+![Unity](https://img.shields.io/badge/Unity-2022.3%E2%80%93Unity6.1-black.svg)
 ![.NET](https://img.shields.io/badge/.NET-C%23_9.0-purple.svg)
 ![GitHub Stars](https://img.shields.io/github/stars/isuzu-shiranui/UnityMCP?style=social)
 
 [日本語版](./README.md)
 
-An extensible framework for integrating Unity with the Model Context Protocol (MCP). This framework enables AI language models like Claude to interact directly with the Unity Editor through a scalable handler architecture.
+An extensible framework that integrates Unity Editor with the Model Context Protocol (MCP). Claude (and other MCP clients) — or any HTTP client like curl — can drive the Unity Editor directly.
 
-## 🌟 Features
+## 🌟 Features (v2.1)
 
-- **Extensible Plugin Architecture**: Create and register custom handlers to extend functionality
-- **Complete MCP Integration**: Supports all MCP core features including tools, resources, and prompts
-- **TypeScript & C# Support**: Server component in TypeScript, Unity component in C#
-- **Editor Integration**: Functions as an editor tool with customizable settings
-- **Auto-discovery**: Automatic detection and registration of various handlers
-- **Communication**: TCP/IP-based communication between Unity and external AI services
+- **HTTP + UDP architecture**: every Unity Editor hosts an HTTP server and announces itself via UDP broadcast for auto-discovery
+- **MCP *and* HTTP surfaces**: drive from Claude Desktop / Claude Code via MCP tools, *or* from scripts / CI via curl
+- **Multi-Editor support**: run several Unity Editors side-by-side and route by project name via `target` or the HTTP proxy
+- **Domain reload resilience**: `SessionState` persists the port so the same port is rebound automatically after a reload
+- **Editor panel screenshots** *(Windows)*: capture Inspector / Hierarchy / Project / Console or any EditorWindow by title
+- **Built-in code execution**: HTTP `/execute_code` endpoint and MCP tool `unity_execute_code` ship out of the box (Roslyn)
+- **Plugin handlers**: implement `IMcpCommandHandler` / `IMcpResourceHandler` / `BasePromptHandler` and they're auto-registered via reflection
+- **Unified response envelope**: `{status, result?, error?, truncated?, next?}` for success / error / pagination
+- **Context economy**: `limit` / `offset` / `fields` / `detail` to slim down large responses
+- **Idempotency classification**: `Safe` / `Unsafe` per-action; TS inspects `err.cause.code` so Unsafe calls never retry after the TCP handshake completes (no double-execution of side effects)
 
 ## 📋 Requirements
 
-- Unity 2022.3.22f1 or later (also compatible with Unity 6.1)
-   - Tested with 2022.3.22f1, 2023.2.19f1, 6000.0.35f1, and 6000.1.0f1
-- .NET/C# 9.0
-- Node.js 18.0.0 or later with npm (for TypeScript server)
-   - Install from the [Node.js official site](https://nodejs.org/)
+- Unity 2022.3 or later (including Unity 6000 series)
+  - Tested with 2022.3.22f1, 2023.2.19f1, 6000.0.35f1, 6000.1.17f1
+- .NET / C# 9.0
+- Node.js 18.0.0 or later (for the TypeScript MCP server)
+  - Get it from the [Node.js official site](https://nodejs.org/)
 
 ## 🚀 Getting Started
 
 ### Installation
 
-1. Install using the Unity Package Manager:
-   - Open Package Manager (Window > Package Manager)
-   - Click the "+" button
-   - Select "Add package from git URL..."
-   - Enter: `https://github.com/isuzu-shiranui/UnityMCP.git?path=jp.shiranui-isuzu.unity-mcp`
+Install via the Unity Package Manager:
 
-### Quick Setup
+1. Window > Package Manager
+2. `+` → **Add package from git URL...**
+3. Enter `https://github.com/isuzu-shiranui/UnityMCP.git?path=jp.shiranui-isuzu.unity-mcp`
 
-1. Open Unity, navigate to Edit > Preferences > Unity MCP
-2. Configure connection settings (host and port)
-3. Click "Connect" to start listening for connections
+### Quick setup
 
-### Integration with Claude Desktop
+1. Launching the Unity Editor spawns the HTTP server automatically (127.0.0.1:27182, falling back up to 27199)
+2. Open Edit > Preferences > Unity MCP to confirm settings
+3. Sanity check: `curl http://127.0.0.1:27182/health`
 
-#### Using the Installer
+### Integrating with Claude Desktop / Claude Code
 
-Unity MCP includes a tool for easy installation and configuration of the TypeScript client.
+#### Using the installer
 
-1. In the Unity Editor, navigate to "Edit > Preferences > Unity MCP"
-2. Click the "Open Installer Window" button to open the TypeScript client installer
-3. Follow the installer instructions:
-   - Verify that Node.js is installed (a download link will be displayed if it's not installed)
-   - Click the "Latest" button to get the most recent version
-   - Select the destination folder and click "Download and Install TypeScript Client"
-   - Once installation is complete, open the "Configuration Preview" section to copy the configuration JSON to your clipboard
-4. Configure Claude Desktop:
-   - Open Claude Desktop
-   - Click the "Claude" menu and select "Settings..."
-   - Click the "Developer" tab and click the "Edit Config" button
-   - Paste the copied configuration and save
-5. Restart Claude Desktop to apply the settings
+1. In the Unity Editor, open Edit > Preferences > Unity MCP
+2. Click **Open Installer Window**
+3. Follow the installer: confirm Node.js is available, then download the TypeScript client
+4. Copy the JSON from the **Configuration Preview** section
+5. In Claude Desktop: Settings > Developer > **Edit Config**, paste, and save
+6. Restart Claude Desktop
 
-This allows Claude Desktop to automatically connect to the Unity MCP client, enabling seamless integration with the Unity Editor.
+> 💡 **macOS users**: v2.1 detects Homebrew-installed Node at `/opt/homebrew/bin/node` or `/usr/local/bin/node`. This fixes the case where Unity Editor launched from Finder doesn't inherit the shell PATH (#7).
 
-#### Manual Installation
+#### Manual setup
 
-1. Download and extract the latest ZIP file from the release page
-2. Note the full path to the `build/index.js` file
-3. Open the Claude Desktop configuration file `claude_desktop_config.json`
-4. Add the following content and save:
+1. Clone `unity-mcp-ts` or download the release ZIP
+2. Run `npm install && npm run build` to produce `build/index.js`
+3. Add this to `claude_desktop_config.json`:
 
 ```json
 {
-   "mcpServers": {
-      "unity-mcp": {
-         "command": "node",
-         "args": [
-            "path/to/index.js"
-         ]
-      }
-   }
+  "mcpServers": {
+    "unity-mcp": {
+      "command": "node",
+      "args": ["/absolute/path/to/unity-mcp-ts/build/index.js"]
+    }
+  }
 }
 ```
-Note: Replace `path/to/index.js` with the actual path (for Windows, either escape backslashes "\\\\" or use forward slashes "/")
 
-## 🔌 Architecture
+On Windows, escape backslashes (`\\`) or use forward slashes.
 
-The Unity MCP framework consists of two main components:
+### Use it from the CLI (curl)
 
-### 1. Unity C# Plugin
+No TypeScript server required — the Unity Editor's HTTP endpoints are directly callable:
 
-- **McpServer**: Core server that listens for TCP connections and routes commands
-- **IMcpCommandHandler**: Interface for creating custom command handlers
-- **IMcpResourceHandler**: Interface for creating data-providing resources
-- **McpSettings**: Manages plugin settings
-- **McpServiceManager**: Dependency injection system for service management
-- **McpHandlerDiscovery**: Automatically discovers and registers various handlers
+```bash
+# Health check
+curl http://127.0.0.1:27182/health
 
-### 2. TypeScript MCP Client
+# Execute C# code
+curl -X POST http://127.0.0.1:27182/execute_code \
+  -H "Content-Type: application/json" \
+  -d '{"code":"return GameObject.FindObjectsByType<Transform>(FindObjectsSortMode.None).Length;"}'
 
-- **HandlerAdapter**: Adapts various handlers to the MCP SDK
-- **HandlerDiscovery**: Discovers and registers handler implementations
-- **UnityConnection**: Manages TCP/IP communication with Unity
-- **BaseCommandHandler**: Base class for command handler implementations
-- **BaseResourceHandler**: Base class for resource handler implementations
-- **BasePromptHandler**: Base class for prompt handler implementations
+# Screenshot the Inspector (Windows)
+curl -X POST http://127.0.0.1:27182/capture_screenshot \
+  -H "Content-Type: application/json" \
+  -d '{"view":"inspector","maxSize":1024}'
+```
+
+For multi-Editor setups, use the TS server's proxy:
+
+```bash
+# Discover all running Unity instances (TS server on :27180)
+curl http://127.0.0.1:27180/projects
+
+# Route to a specific project by name
+curl -X POST http://127.0.0.1:27180/proxy/MyProject/health
+```
+
+A Skill at `~/.claude/skills/unity-mcp/` documents common curl workflows.
+
+## 🔌 Architecture (v2.1)
+
+```
+MCP client (Claude)
+    │ stdio (MCP protocol)
+    ▼
+unity-mcp-ts (Node)
+    ├── HandlerAdapter / HandlerDiscovery  (MCP tools / prompts / resources)
+    ├── UnityConnection                     (HTTP fetch + retryableFetch)
+    │       ├── sendRequest(cmd, params)    → POST /command
+    │       └── sendToEndpoint(path, body)  → POST <path>  (e.g. /execute_code)
+    ├── ProjectRegistry                     (UDP :27183, state machine)
+    └── ProjectApi :27180-27189             (/projects, /proxy/:name/*)
+            │ HTTP
+            ▼
+Unity Editor(s) — McpHttpServer :27182-27199
+    ├── HttpListener + main-thread execution queue
+    ├── Built-in shortcuts + plugin handlers
+    └── UDP broadcast (27183) every 30s
+```
+
+### Unity C# side
+
+- **McpHttpServer**: HTTP listener + UDP broadcaster + main-thread execution queue
+- **IMcpCommandHandler** / **IMcpResourceHandler**: plugin extension interfaces (with idempotency)
+- **McpIdempotency**: `Safe` / `Unsafe` enum
+- **ListResponseBuilder**: shared utility for `limit` / `offset` / `fields`
+- **McpEditorInitializer**: `InitializeOnLoad` + `AssemblyReloadEvents`; restores port via SessionState
+- **McpHandlerDiscovery**: auto-registers handler classes via reflection
+
+### TypeScript MCP server
+
+- **HandlerAdapter**: registers tools / prompts / resources with the MCP SDK
+- **HandlerDiscovery**: scans `src/handlers/` and auto-registers `ICommandHandler` / `IPromptHandler` / `IResourceHandler`
+- **UnityConnection**: HTTP client with retry + idempotency + target resolution
+- **ProjectRegistry**: UDP receiver + 3-state machine (healthy / reloading / unhealthy)
+- **ProjectApi**: 27180-27189 `/projects` + `/proxy/:name/*`
+- **retryableFetch**: inspects `err.cause.code` and restricts Unsafe retries to pre-handshake failures
 
 ## 📄 MCP Handler Types
 
-Unity MCP supports three types of handlers based on the Model Context Protocol (MCP):
+| Type | Purpose | MCP control | Interface |
+|---|---|---|---|
+| Tools (Command) | Perform actions | Model-driven | `IMcpCommandHandler` (C#) / `BaseCommandHandler` (TS) |
+| Resources | Provide data | App-driven | `IMcpResourceHandler` (C#) / `BaseResourceHandler` (TS) |
+| Prompts | Templates / workflows | User-driven | `BasePromptHandler` (TS only) |
 
-### 1. Command Handlers (Tools)
+## 📚 Built-in Handlers
 
-- **Purpose**: Tools for executing actions (making Unity perform operations)
-- **Control**: Model-controlled - AI models can automatically invoke them
-- **Implementation**: Implement the IMcpCommandHandler interface
+### HTTP endpoints (Editor, built-in)
 
-### 2. Resource Handlers (Resources)
+| Endpoint | Idempotency | Description |
+|---|---|---|
+| `GET /health` | Safe | Version, handler list, uptime |
+| `POST /execute_code` | Unsafe | Dynamically compile / run C# via Roslyn |
+| `POST /browse_hierarchy` | Safe | Scene hierarchy with filters (supports limit/offset/fields) |
+| `POST /inspect` | read/list: Safe, write: Unsafe | Read / write GameObject & component properties |
+| `POST /capture_screenshot` | Safe | Game / Scene / Editor panel (inspector / hierarchy / project / console / `window:<title>`) |
+| `POST /read_logs` | Safe | Console logs (limit/offset/fields/type) |
+| `POST /play_mode` | status: Safe, others: Unsafe | Play Mode control (status/play/stop/pause/unpause/step) |
+| `GET /resource` | Safe | Assemblies / packages info |
+| `POST /command` | per-command | Plugin handlers (`menu.execute`, `console.*`) |
 
-- **Purpose**: Resources for accessing data within Unity (information providers)
-- **Control**: Application-controlled - Client applications decide their use
-- **Implementation**: Implement the IMcpResourceHandler interface
+### MCP tools (TS, built-in)
 
-### 3. Prompt Handlers (Prompts)
+`unity_listClients`, `unity_setActiveClient`, `unity_connectToProject`, `unity_getActiveClient`, `unity_execute_code`, `console_getLogs`, `console_getCount`, `console_clear`, `console_setFilter`, `menu_execute`
 
-- **Purpose**: Reusable prompt templates and workflows
-- **Control**: User-controlled - Users explicitly select them for use
-- **Implementation**: Implement the IPromptHandler interface (TypeScript side only)
+### MCP prompts (TS, built-in)
 
-## 🔬 Sample Code
+- `code_execute`: C# code template for `unity_execute_code`
 
-The package includes the following samples:
+Every tool / endpoint accepts an optional `target` parameter (projectName or clientId) to route requests in multi-Editor setups.
 
-1. **Unity MCP Handler Samples**
-   - Sample code with C# implementations
-   - Can be imported directly into your project
+## 🛠️ Writing Custom Handlers
 
-2. **Unity MCP Handler Samples JavaScript**
-   - Sample code with JavaScript implementations
-   - Copy the JS files from this sample to the `build/handlers` directory for use
-
-> ⚠️ **Caution**: Sample code includes code execution functionality. Use with caution in production environments.
-
-To import samples:
-1. Select this package in Unity Package Manager
-2. Click the "Samples" tab
-3. Click the "Import" button for the samples you need
-
-## 🛠️ Creating Custom Handlers
-
-### Command Handler (C#)
-
-Create a new class implementing `IMcpCommandHandler`:
+### Command handler (C#)
 
 ```csharp
 using Newtonsoft.Json.Linq;
@@ -163,279 +196,136 @@ namespace YourNamespace.Handlers
     internal sealed class YourCommandHandler : IMcpCommandHandler
     {
         public string CommandPrefix => "yourprefix";
-        public string Description => "Description of your handler";
+        public string Description => "Handler description";
+        public McpIdempotency Idempotency => McpIdempotency.Safe; // use Unsafe for side-effecting actions
 
         public JObject Execute(string action, JObject parameters)
         {
-            // Implement command logic
             if (action == "yourAction")
             {
-                // Execute something with parameters
-                return new JObject
-                {
-                    ["success"] = true,
-                    ["result"] = "Result data"
-                };
+                return new JObject { ["result"] = "..." };
             }
-
-            return new JObject
-            {
-                ["success"] = false,
-                ["error"] = $"Unknown action: {action}"
-            };
+            // The envelope writer promotes `{error: "..."}` to a proper error response automatically
+            return new JObject { ["error"] = $"Unknown action: {action}" };
         }
     }
 }
 ```
 
-### Resource Handler (C#)
-
-Create a new class implementing `IMcpResourceHandler`:
-
-```csharp
-using Newtonsoft.Json.Linq;
-using UnityMCP.Editor.Resources;
-
-namespace YourNamespace.Resources
-{
-    internal sealed class YourResourceHandler : IMcpResourceHandler
-    {
-        public string ResourceName => "yourresource";
-        public string Description => "Description of your resource";
-        public string ResourceUri => "unity://yourresource";
-
-        public JObject FetchResource(JObject parameters)
-        {
-            // Implement resource data retrieval
-            var data = new JArray();
-            
-            // Get and process data to add to JArray
-            data.Add(new JObject
-            {
-                ["name"] = "Item 1",
-                ["value"] = "Value 1"
-            });
-
-            return new JObject
-            {
-                ["success"] = true,
-                ["items"] = data
-            };
-        }
-    }
-}
-```
-
-### Command Handler (TypeScript)
-
-Extend `BaseCommandHandler` to create a new handler:
+### Command handler (TypeScript)
 
 ```typescript
+import { BaseCommandHandler } from "../core/BaseCommandHandler.js";
 import { IMcpToolDefinition } from "../core/interfaces/ICommandHandler.js";
 import { JObject } from "../types/index.js";
 import { z } from "zod";
-import { BaseCommandHandler } from "../core/BaseCommandHandler.js";
 
 export class YourCommandHandler extends BaseCommandHandler {
-   public get commandPrefix(): string {
-      return "yourprefix";
-   }
+    public get commandPrefix(): string { return "yourprefix"; }
+    public get description(): string { return "Handler description"; }
 
-   public get description(): string {
-      return "Description of your handler";
-   }
+    public getToolDefinitions(): Map<string, IMcpToolDefinition> {
+        const tools = new Map();
+        tools.set("yourprefix_yourAction", {
+            description: "Action description",
+            parameterSchema: { param1: z.string() }
+        });
+        return tools;
+    }
 
-   public getToolDefinitions(): Map<string, IMcpToolDefinition> {
-      const tools = new Map<string, IMcpToolDefinition>();
-
-      // Define tools
-      tools.set("yourprefix_yourAction", {
-         description: "Description of the action",
-         parameterSchema: {
-            param1: z.string().describe("Description of parameter"),
-            param2: z.number().optional().describe("Optional parameter")
-         },
-         annotations: {
-            title: "Tool title",
-            readOnlyHint: true,
-            openWorldHint: false
-         }
-      });
-
-      return tools;
-   }
-
-   protected async executeCommand(action: string, parameters: JObject): Promise<JObject> {
-      // Implement command logic
-      // Forward request to Unity
-      return await this.sendUnityRequest(
-              `${this.commandPrefix}.${action}`,
-              parameters
-      );
-   }
+    protected async executeCommand(action: string, parameters: JObject): Promise<JObject> {
+        return this.sendUnityRequest(`${this.commandPrefix}.${action}`, parameters);
+    }
 }
 ```
 
-### Resource Handler (TypeScript)
-
-Extend `BaseResourceHandler` to create a new resource handler:
-
-```typescript
-import { BaseResourceHandler } from "../core/BaseResourceHandler.js";
-import { JObject } from "../types/index.js";
-import { URL } from "url";
-
-export class YourResourceHandler extends BaseResourceHandler {
-   public get resourceName(): string {
-      return "yourresource";
-   }
-
-   public get description(): string {
-      return "Description of your resource";
-   }
-
-   public get resourceUriTemplate(): string {
-      return "unity://yourresource";
-   }
-
-   protected async fetchResourceData(uri: URL, parameters?: JObject): Promise<JObject | string> {
-      // Process request parameters
-      const param1 = parameters?.param1 as string;
-
-      // Send request to Unity
-      const response = await this.sendUnityRequest("yourresource.get", {
-         param1: param1
-      });
-
-      if (!response.success) {
-         throw new Error(response.error as string || "Failed to retrieve resource");
-      }
-
-      // Format and return response data
-      return {
-         items: response.items || []
-      };
-   }
-}
-```
-
-### Prompt Handler (TypeScript)
-
-Extend `BasePromptHandler` to create a new prompt handler:
+### Prompt handler (TypeScript)
 
 ```typescript
 import { BasePromptHandler } from "../core/BasePromptHandler.js";
 import { IMcpPromptDefinition } from "../core/interfaces/IPromptHandler.js";
-import { z } from "zod";
 
 export class YourPromptHandler extends BasePromptHandler {
-   public get promptName(): string {
-      return "yourprompt";
-   }
+    public get promptName(): string { return "yourprompt"; }
+    public get description(): string { return "Prompt description"; }
 
-   public get description(): string {
-      return "Description of your prompt";
-   }
-
-   public getPromptDefinitions(): Map<string, IMcpPromptDefinition> {
-      const prompts = new Map<string, IMcpPromptDefinition>();
-
-      // Register prompt definitions
-      prompts.set("analyze-component", {
-         description: "Analyze a Unity component",
-         template: "Please analyze the following Unity component in detail and suggest improvements:\n\n```csharp\n{code}\n```",
-         additionalProperties: {
-            code: z.string().describe("C# code to analyze")
-         }
-      });
-
-      return prompts;
-   }
+    public getPromptDefinitions(): Map<string, IMcpPromptDefinition> {
+        const prompts = new Map();
+        prompts.set("your-template", {
+            description: "Template description",
+            template: "Analyse the following code:\n{code}"
+        });
+        return prompts;
+    }
 }
 ```
 
-**Note**: Classes implementing `IMcpCommandHandler` or `IMcpResourceHandler` in C# will be automatically detected and registered anywhere in your project through assembly scanning. Similarly, TypeScript handlers are automatically detected when placed in the `handlers` directory.
-
-## 🔄 Communication Flow
-
-1. Claude (or other AI) calls one of the MCP features (tool/resource/prompt)
-2. TypeScript server forwards the request to Unity via TCP
-3. Unity's McpServer receives the request and finds the appropriate handler
-4. The handler processes the request on Unity's main thread
-5. Results are returned to the TypeScript server through the TCP connection
-6. TypeScript server formats and returns the results to Claude
+> 💡 C# handlers can live anywhere in your project — `McpHandlerDiscovery` finds them via reflection. TS handlers under `unity-mcp-ts/src/handlers/` are picked up by `HandlerDiscovery`.
 
 ## ⚙️ Configuration
 
-### Unity Settings
+### Unity Editor settings
 
-Access settings via Edit > Preferences > Unity MCP:
+Edit > Preferences > Unity MCP:
 
-- **Host**: IP address to bind the server to (default: 127.0.0.1)
-- **Port**: Port to listen on (default: 27182)
-- **UDP Discovery**: Enable automatic discovery of TypeScript server
-- **Auto-start on Launch**: Automatically start server when Unity launches
-- **Auto-restart on Play Mode Change**: Restart server when play mode starts/ends
-- **Detailed Logs**: Enable detailed logs for debugging
+- **HTTP Port**: starting port (default 27182, falls back through 27199)
+- **Auto-start on Launch**: start the server when the Editor launches
+- **UDP Discovery**: enable UDP broadcasts on port 27183 (default every 30 s)
+- **Broadcast Interval**: UDP broadcast cadence
+- **Port Persistence**: keep the same port across domain reloads
+- **Reload Retry Max MS**: hint for TS / CLI retry cap
+- **Detailed Logs**: verbose logging
+- **Handler / Resource Enabled States**: per-handler toggles
 
-### TypeScript Settings
+> ⚠️ v2.1 **removed `Auto-restart on Play Mode Change`**. Play Mode transitions no longer restart the server; the `AssemblyReloadEvents` path handles the reload case automatically.
 
-Environment variables for the TypeScript server:
+### TypeScript server environment variables
 
-- `MCP_HOST`: Unity server host (default: 127.0.0.1)
-- `MCP_PORT`: Unity server port (default: 27182)
+| Variable | Default | Description |
+|---|---|---|
+| `MCP_RELOAD_RETRY_MAX_MS` | 15000 | Retry ceiling during domain reloads (ms) |
+| `MCP_UNHEALTHY_COOLDOWN_MS` | 60000 | Grace before promoting `reloading` → `unhealthy` |
+| `MCP_PROJECT_API_PORT` | 27180 | ProjectApi starting port (27180-27189 fallback) |
+| `MCP_UDP_PORT` | 27183 | UDP announce listener port |
+| `MCP_HEALTH_INTERVAL` | 10000 | Health-poll interval (ms) |
+
+## 🧪 Tests
+
+- **Unity (EditMode)**: `Editor/Tests/` — 23 cases (ListResponseBuilder / Envelope / Idempotency / ScreenshotCapture)
+- **TypeScript (Jest)**: `unity-mcp-ts/src/__tests__/` — 68 cases (UnityConnection / ProjectRegistry / ProjectApi / retry / cache)
+
+```bash
+cd unity-mcp-ts
+npm test    # expects 68/68 pass
+```
 
 ## 🔍 Troubleshooting
 
-### Common Issues
+| Symptom | Remedy |
+|---|---|
+| Can't reach `/health` | Confirm Unity is running, the package is imported, and something is listening on 27182-27199 |
+| `target_required` error | Multiple Unity instances with no `target` specified — pass `target` or call `unity_setActiveClient` |
+| Connection drops after domain reload | v2.1 rebinds automatically; if not, check Unity logs for SessionState failures |
+| C# handlers not registered | Confirm the class is `public` / `internal` in the Editor assembly, implements `IMcpCommandHandler`, and compiles |
+| Node not detected (macOS) | v2.1 adds Homebrew fallback paths. Upgrade to the latest release (#7) |
 
-1. **Connection Errors**
-   - Check firewall settings on Unity side
-   - Verify port number is correctly configured
-   - Check if another process is using the same port
+Detailed error codes are documented in `unity-mcp-ts/README.md` and the [Skill api-reference](~/.claude/skills/unity-mcp/references/api-reference.md).
 
-2. **Handlers Not Registering**
-   - Verify handler classes implement the correct interface
-   - Check if C# handlers have public or internal access level
-   - Check logs in Unity for errors during registration process
+## 🔒 Security
 
-3. **Resources Not Found**
-   - Verify resource name and URI match
-   - Check if resource handler is properly enabled
-
-### Checking Logs
-
-- Unity Console: Check log messages from McpServer
-- TypeScript Server: Use console output or MCP Inspector to check for communication errors
-
-## 📚 Built-in Handlers
-
-### Unity (C#)
-
-- **MenuItemCommandHandler**: Execute Unity editor menu items
-- **ConsoleCommandHandler**: Operate Unity console logs
-- **AssembliesResourceHandler**: Retrieve assembly information
-- **PackagesResourceHandler**: Retrieve package information
-
-### TypeScript
-
-- **MenuItemCommandHandler**: Execute menu items
-- **ConsoleCommandHandler**: Operate console logs
-- **AssemblyResourceHandler**: Retrieve assembly information
-- **PackageResourceHandler**: Retrieve package information
+- **`/execute_code` runs arbitrary C#**. If the endpoint is exposed to anything beyond yourself, disable it via McpSettings or restrict the listener to loopback (v2.x binds 127.0.0.1 only by default).
+- **No external exposure**: all HTTP/UDP listeners are loopback-only. LAN exposure is unsupported.
 
 ## 📖 External Resources
 
 - [Model Context Protocol (MCP) Specification](https://modelcontextprotocol.io/introduction)
-
-## ⚠️ Security Notes
-
-1. **Do not run untrusted handlers**: Review third-party handler code for security before use.
-2. **Restrict code execution permissions**: Especially consider disabling handlers with `code_execute` command in production environments as they can execute arbitrary code.
+- [unity-mcp-ts README](./unity-mcp-ts/README.md) (TypeScript server details)
+- [Unity package README](./jp.shiranui-isuzu.unity-mcp/README.md) (Editor-side details)
+- [CHANGELOG](./jp.shiranui-isuzu.unity-mcp/CHANGELOG.md)
 
 ## 📄 License
 
-This project is provided under the MIT License - see the license file for details.
+MIT License — see the license file for details.
 
 ---
 
