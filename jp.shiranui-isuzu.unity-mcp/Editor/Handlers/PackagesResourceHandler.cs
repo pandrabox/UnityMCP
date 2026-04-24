@@ -1,13 +1,18 @@
-﻿using System.Threading;
+using System.Collections.Generic;
+using System.Threading;
+
 using UnityEditor.PackageManager;
 using UnityEngine;
 using Newtonsoft.Json.Linq;
 using PackageInfo = UnityEditor.PackageManager.PackageInfo;
 
+using UnityMCP.Editor.Core;
+
 namespace UnityMCP.Editor.Resources
 {
     /// <summary>
     /// Resource handler for Unity Package Manager information.
+    /// Supports limit, offset, and fields for pagination and field filtering.
     /// </summary>
     internal sealed class PackagesResourceHandler : IMcpResourceHandler
     {
@@ -29,49 +34,44 @@ namespace UnityMCP.Editor.Resources
         /// <summary>
         /// Fetches package information with the provided parameters.
         /// </summary>
-        /// <param name="parameters">Resource parameters as a JObject.</param>
-        /// <returns>A JSON object containing package information.</returns>
         public JObject FetchResource(JObject parameters)
         {
-            // Get project packages (installed)
-            var projectPackages = this.GetProjectPackages();
-
-            // Check if we should include registry packages
             var includeRegistry = parameters?["includeRegistry"]?.Value<bool>() ?? false;
-            JArray registryPackages = null;
+            var limit = parameters?["limit"]?.Value<int>() ?? int.MaxValue;
+            var offset = parameters?["offset"]?.Value<int>() ?? 0;
+            var fieldsFilter = ListResponseBuilder.ParseFieldsParam(parameters?["fields"]?.ToString());
+
+            var projectPackageList = this.GetProjectPackageList();
+
+            var page = ListResponseBuilder.Build(
+                projectPackageList,
+                offset,
+                limit,
+                p => this.PackageToJObject(p, "installed"),
+                fieldsFilter);
+
+            var result = new JObject
+            {
+                ["projectPackages"] = page["items"],
+                ["count"] = projectPackageList.Count,
+                ["truncated"] = page["truncated"],
+                ["next"] = page["next"]
+            };
 
             if (includeRegistry)
             {
-                registryPackages = this.GetRegistryPackages();
-            }
-
-            // Return combined result
-            var result = new JObject
-            {
-                ["success"] = true,
-                ["projectPackages"] = projectPackages
-            };
-
-            if (registryPackages != null)
-            {
+                var registryPackages = this.GetRegistryPackages();
                 result["registryPackages"] = registryPackages;
             }
 
             return result;
         }
 
-        /// <summary>
-        /// Gets packages installed in the current project.
-        /// </summary>
-        /// <returns>A JArray containing information about installed packages.</returns>
-        private JArray GetProjectPackages()
+        private List<PackageInfo> GetProjectPackageList()
         {
-            var result = new JArray();
-
-            // List installed packages
+            var result = new List<PackageInfo>();
             var listRequest = Client.List(true);
 
-            // Wait for the request to complete
             while (!listRequest.IsCompleted)
             {
                 Thread.Sleep(100);
@@ -80,9 +80,7 @@ namespace UnityMCP.Editor.Resources
             if (listRequest.Status == StatusCode.Success)
             {
                 foreach (var package in listRequest.Result)
-                {
-                    result.Add(this.PackageToJObject(package, "installed"));
-                }
+                    result.Add(package);
             }
             else if (listRequest.Status == StatusCode.Failure)
             {
@@ -92,18 +90,11 @@ namespace UnityMCP.Editor.Resources
             return result;
         }
 
-        /// <summary>
-        /// Gets packages available from the Unity Registry.
-        /// </summary>
-        /// <returns>A JArray containing information about registry packages.</returns>
         private JArray GetRegistryPackages()
         {
             var result = new JArray();
-
-            // Search Unity registry packages
             var searchRequest = Client.SearchAll();
 
-            // Wait for the request to complete
             while (!searchRequest.IsCompleted)
             {
                 Thread.Sleep(100);
@@ -112,11 +103,7 @@ namespace UnityMCP.Editor.Resources
             if (searchRequest.Status == StatusCode.Success)
             {
                 foreach (var package in searchRequest.Result)
-                {
-                    // Check if package is already installed
-                    var state = "available";
-                    result.Add(this.PackageToJObject(package, state));
-                }
+                    result.Add(this.PackageToJObject(package, "available"));
             }
             else if (searchRequest.Status == StatusCode.Failure)
             {
@@ -126,12 +113,6 @@ namespace UnityMCP.Editor.Resources
             return result;
         }
 
-        /// <summary>
-        /// Convert a package info object to JObject.
-        /// </summary>
-        /// <param name="package">Package info.</param>
-        /// <param name="state">Installation state.</param>
-        /// <returns>JObject with package info.</returns>
         private JObject PackageToJObject(PackageInfo package, string state)
         {
             return new JObject

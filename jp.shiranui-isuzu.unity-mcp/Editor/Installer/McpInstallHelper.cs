@@ -58,25 +58,108 @@ namespace UnityMCP.Editor.Installer
         }
 
         /// <summary>
-        /// Checks if Node.js is installed on the system.
+        /// Candidate absolute paths to the `node` binary, in priority order.
+        /// Used as a fallback on macOS where Unity Editor's inherited PATH
+        /// often does not include Homebrew's directory (issue #7).
+        /// </summary>
+        private static readonly string[] MacNodeFallbackPaths =
+        {
+            "/opt/homebrew/bin/node",   // Apple Silicon Homebrew
+            "/usr/local/bin/node",      // Intel / manual Homebrew
+            "/usr/bin/node",            // System default
+        };
+
+        /// <summary>
+        /// Cached result of the last successful node lookup: the resolved executable
+        /// (either "node" for a PATH hit or an absolute path for a fallback hit).
+        /// Null when not yet looked up or when no installation was found.
+        /// </summary>
+        private static string resolvedNodeExecutable;
+
+        /// <summary>
+        /// Checks if Node.js is installed on the system. On macOS, falls back to
+        /// common Homebrew / system paths when "node" is not resolvable via PATH
+        /// (Unity Editor launched from Finder does not inherit the shell PATH).
         /// </summary>
         /// <returns>True if Node.js is installed, false otherwise.</returns>
         public static bool IsNodeInstalled()
         {
+            return !string.IsNullOrEmpty(ResolveNodeExecutableOrNull());
+        }
+
+        /// <summary>
+        /// Resolves the absolute or PATH-relative executable to use for spawning
+        /// node. Returns an empty string if Node.js cannot be located.
+        /// </summary>
+        public static string ResolveNodeExecutable()
+        {
+            return ResolveNodeExecutableOrNull() ?? string.Empty;
+        }
+
+        private static string ResolveNodeExecutableOrNull()
+        {
+            if (!string.IsNullOrEmpty(resolvedNodeExecutable))
+            {
+                return resolvedNodeExecutable;
+            }
+
+            // First attempt: plain "node" via PATH (Windows / Linux / macOS with shell-inherited PATH).
+            if (TryRunNode("node"))
+            {
+                resolvedNodeExecutable = "node";
+                return resolvedNodeExecutable;
+            }
+
+            // Second attempt (macOS only): well-known Homebrew / system install locations.
+            if (Application.platform == RuntimePlatform.OSXEditor)
+            {
+                foreach (var candidate in MacNodeFallbackPaths)
+                {
+                    if (File.Exists(candidate) && TryRunNode(candidate))
+                    {
+                        resolvedNodeExecutable = candidate;
+                        return resolvedNodeExecutable;
+                    }
+                }
+            }
+
+            return null;
+        }
+
+        /// <summary>
+        /// Attempts to invoke "<paramref name="exe"/> --version" and returns true
+        /// iff the process exits cleanly and prints a version string starting with 'v'.
+        /// </summary>
+        private static bool TryRunNode(string exe)
+        {
             try
             {
-                var process = new Process();
-                process.StartInfo.FileName = "node";
-                process.StartInfo.Arguments = "--version";
-                process.StartInfo.UseShellExecute = false;
-                process.StartInfo.RedirectStandardOutput = true;
-                process.StartInfo.CreateNoWindow = true;
+                var psi = new ProcessStartInfo
+                {
+                    FileName = exe,
+                    Arguments = "--version",
+                    UseShellExecute = false,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    CreateNoWindow = true,
+                };
 
-                process.Start();
+                using var process = Process.Start(psi);
+                if (process == null)
+                {
+                    return false;
+                }
+
                 var output = process.StandardOutput.ReadToEnd();
-                process.WaitForExit();
+                if (!process.WaitForExit(3000))
+                {
+                    try { process.Kill(); } catch { /* ignore */ }
+                    return false;
+                }
 
-                return !string.IsNullOrEmpty(output) && output.StartsWith("v");
+                return process.ExitCode == 0
+                       && !string.IsNullOrEmpty(output)
+                       && output.TrimStart().StartsWith("v");
             }
             catch
             {
@@ -269,6 +352,14 @@ namespace UnityMCP.Editor.Installer
                 // Normalize path to use the correct slashes for the platform
                 var normalizedPath = NormalizePath(clientJsPath);
 
+                // Use the resolved node executable so the generated config works
+                // when Claude Desktop spawns the MCP server from an environment
+                // without Homebrew's bin directory on PATH (issue #7).
+                // Falls back to the bare "node" literal when detection fails,
+                // preserving prior behavior for Windows / Linux installs.
+                var resolvedNode = ResolveNodeExecutable();
+                var commandValue = string.IsNullOrEmpty(resolvedNode) ? "node" : resolvedNode;
+
                 // Create configuration object
                 var configObject = new JObject
                 {
@@ -276,7 +367,7 @@ namespace UnityMCP.Editor.Installer
                     {
                         ["unity-mcp"] = new JObject
                         {
-                            ["command"] = "node",
+                            ["command"] = commandValue,
                             ["args"] = new JArray { normalizedPath }
                         }
                     }

@@ -1,4 +1,4 @@
-﻿using System.Collections.Generic;
+using System.Collections.Generic;
 using UnityEditor;
 using UnityEngine;
 using UnityMCP.Editor.Core;
@@ -15,7 +15,7 @@ namespace UnityMCP.Editor.Settings
         private bool showCommandHandlers = false;
         private bool showResourceHandlers = false;
         private Vector2 handlersRootScrollPosition;
-        private McpServer mcpServer;
+        private McpHttpServer mcpServer;
         private GUIStyle headerStyle;
         private GUIStyle subHeaderStyle;
         private GUIStyle descriptionStyle;
@@ -23,10 +23,6 @@ namespace UnityMCP.Editor.Settings
         private GUIContent disabledIcon;
         private Color defaultBackgroundColor;
 
-        /// <summary>
-        /// Creates and registers the MCP settings provider.
-        /// </summary>
-        /// <returns>An instance of the settings provider.</returns>
         [SettingsProvider]
         public static SettingsProvider CreateMcpSettingsProvider()
         {
@@ -37,34 +33,21 @@ namespace UnityMCP.Editor.Settings
             return provider;
         }
 
-        /// <summary>
-        /// Initializes a new instance of the <see cref="McpSettingsProvider"/> class.
-        /// </summary>
-        /// <param name="path">The settings path.</param>
-        /// <param name="scopes">The settings scope.</param>
-        /// <param name="keywords">The search keywords.</param>
         public McpSettingsProvider(string path, SettingsScope scopes, IEnumerable<string> keywords = null)
             : base(path, scopes, keywords)
         {
-            // Try to find the MCP server instance from the service manager
-            if (McpServiceManager.Instance.TryGetService<McpServer>(out var server))
+            if (McpServiceManager.Instance.TryGetService<McpHttpServer>(out var server))
             {
                 this.mcpServer = server;
             }
         }
 
-        /// <summary>
-        /// Called when the settings provider is activated.
-        /// </summary>
-        /// <param name="searchContext">The search context.</param>
-        /// <param name="rootElement">The root UI element.</param>
         public override void OnActivate(string searchContext, UnityEngine.UIElements.VisualElement rootElement)
         {
             var settings = McpSettings.instance;
             settings.hideFlags = HideFlags.HideAndDontSave & ~HideFlags.NotEditable;
             UnityEditor.Editor.CreateCachedEditor(settings, null, ref this.editor);
 
-            // Prepare styles
             this.headerStyle = new GUIStyle(EditorStyles.boldLabel)
             {
                 fontSize = 14,
@@ -82,18 +65,11 @@ namespace UnityMCP.Editor.Settings
                 wordWrap = true
             };
 
-            // Icons
             this.enabledIcon = EditorGUIUtility.IconContent("TestPassed");
             this.disabledIcon = EditorGUIUtility.IconContent("TestFailed");
-
-            // Store default background color for later use
             this.defaultBackgroundColor = GUI.backgroundColor;
         }
 
-        /// <summary>
-        /// Draws the settings UI.
-        /// </summary>
-        /// <param name="searchContext">The search context.</param>
         public override void OnGUI(string searchContext)
         {
             EditorGUI.BeginChangeCheck();
@@ -104,53 +80,55 @@ namespace UnityMCP.Editor.Settings
                 EditorWindow.GetWindow<McpInstallerWindow>();
             }
 
-            GUILayout.Label("Server Configuration", this.headerStyle);
+            GUILayout.Label("HTTP Server Configuration", this.headerStyle);
             EditorGUILayout.Space(5);
 
             var settings = McpSettings.instance;
 
-            // Server host and port
-            settings.host = EditorGUILayout.TextField("Host", settings.host);
-            settings.port = EditorGUILayout.IntField("Port", settings.port);
+            // HTTP port
+            settings.httpPort = EditorGUILayout.IntField("HTTP Port", settings.httpPort);
+
+            EditorGUILayout.HelpBox(
+                "Unity starts an HTTP server on this port. If the port is in use, it will automatically try the next available port.",
+                MessageType.Info);
 
             EditorGUILayout.Space(5);
 
-            // UDP Discovery settings
-            EditorGUILayout.LabelField("Connection Method", this.subHeaderStyle);
-            settings.useUdpDiscovery = EditorGUILayout.Toggle("Use UDP Discovery", settings.useUdpDiscovery);
-            settings.udpDiscoveryPort = EditorGUILayout.IntField("UDP Discovery Port", settings.udpDiscoveryPort);
+            // UDP Broadcast settings
+            EditorGUILayout.LabelField("Discovery", this.subHeaderStyle);
+            settings.useUdpBroadcast = EditorGUILayout.Toggle("UDP Broadcast", settings.useUdpBroadcast);
 
-            EditorGUILayout.HelpBox("UDP Discovery allows the MCP server to automatically find Unity when it starts. Disable this if you experience connection issues.", MessageType.Info);
+            using (new EditorGUI.DisabledScope(!settings.useUdpBroadcast))
+            {
+                settings.udpBroadcastPort = EditorGUILayout.IntField("Broadcast Port", settings.udpBroadcastPort);
+                settings.broadcastIntervalSeconds = EditorGUILayout.IntSlider("Broadcast Interval (sec)", settings.broadcastIntervalSeconds, 5, 120);
+            }
+
+            EditorGUILayout.HelpBox(
+                "UDP Broadcast allows the TypeScript MCP server to automatically discover this Unity instance.",
+                MessageType.Info);
 
             EditorGUILayout.Space(10);
 
             // Auto-start options
             settings.autoStartOnLaunch = EditorGUILayout.Toggle("Auto-start on Launch", settings.autoStartOnLaunch);
-            settings.autoRestartOnPlayModeChange = EditorGUILayout.Toggle("Auto-restart on Play Mode Change", settings.autoRestartOnPlayModeChange);
 
             EditorGUILayout.Space(5);
 
-            // Logging options
             settings.detailedLogs = EditorGUILayout.Toggle("Detailed Logs", settings.detailedLogs);
 
             EditorGUILayout.Space(10);
 
-            // Connection status section
-            this.DrawConnectionStateSection();
+            // Server status section
+            this.DrawServerStatusSection();
 
             EditorGUILayout.Space(10);
 
             this.handlersRootScrollPosition = EditorGUILayout.BeginScrollView(this.handlersRootScrollPosition);
 
-            // Command handlers section
             if (this.mcpServer != null)
             {
                 this.DrawHandlersSection();
-            }
-
-            // Resource handlers section
-            if (this.mcpServer != null)
-            {
                 this.DrawResourceHandlersSection();
             }
 
@@ -162,9 +140,6 @@ namespace UnityMCP.Editor.Settings
             }
         }
 
-        /// <summary>
-        /// Draws the command handlers section.
-        /// </summary>
         private void DrawHandlersSection()
         {
             EditorGUILayout.BeginVertical(EditorStyles.helpBox);
@@ -172,7 +147,6 @@ namespace UnityMCP.Editor.Settings
             EditorGUILayout.BeginHorizontal();
             this.showCommandHandlers = EditorGUILayout.Foldout(this.showCommandHandlers, "Command Handlers", true);
 
-            // Display count of handlers
             var handlers = this.mcpServer.GetRegisteredHandlers();
             var enabledCount = 0;
             foreach (var handler in handlers)
@@ -195,17 +169,15 @@ namespace UnityMCP.Editor.Settings
                 return;
             }
 
-            // Group handlers by assembly
-            var handlersByAssembly = new Dictionary<string, List<KeyValuePair<string, McpServer.HandlerRegistration>>>();
+            var handlersByAssembly = new Dictionary<string, List<KeyValuePair<string, McpHttpServer.HandlerRegistration>>>();
 
             foreach (var handler in handlers)
             {
                 var assemblyName = handler.Value.AssemblyName;
                 if (!handlersByAssembly.ContainsKey(assemblyName))
                 {
-                    handlersByAssembly[assemblyName] = new List<KeyValuePair<string, McpServer.HandlerRegistration>>();
+                    handlersByAssembly[assemblyName] = new List<KeyValuePair<string, McpHttpServer.HandlerRegistration>>();
                 }
-
                 handlersByAssembly[assemblyName].Add(handler);
             }
 
@@ -218,22 +190,15 @@ namespace UnityMCP.Editor.Settings
                 {
                     EditorGUILayout.BeginHorizontal(GUILayout.Height(24));
 
-                    // Toggle for enabling/disabling
                     var enabled = handler.Value.Enabled;
                     var newEnabled = EditorGUILayout.Toggle(enabled, GUILayout.Width(20));
-
                     if (enabled != newEnabled)
                     {
                         this.mcpServer.SetHandlerEnabled(handler.Key, newEnabled);
                     }
 
-                    // Display enabled/disabled icon
                     GUILayout.Label(enabled ? this.enabledIcon : this.disabledIcon, GUILayout.Width(20));
-
-                    // Handler name
                     EditorGUILayout.LabelField(handler.Key, GUILayout.Width(120));
-
-                    // Description
                     EditorGUILayout.LabelField(handler.Value.Description, this.descriptionStyle);
                     EditorGUILayout.EndHorizontal();
                 }
@@ -242,9 +207,6 @@ namespace UnityMCP.Editor.Settings
             EditorGUILayout.EndVertical();
         }
 
-        /// <summary>
-        /// Draws the resource handlers section.
-        /// </summary>
         private void DrawResourceHandlersSection()
         {
             EditorGUILayout.BeginVertical(EditorStyles.helpBox);
@@ -252,7 +214,6 @@ namespace UnityMCP.Editor.Settings
             EditorGUILayout.BeginHorizontal();
             this.showResourceHandlers = EditorGUILayout.Foldout(this.showResourceHandlers, "Resource Handlers", true);
 
-            // Display count of resource handlers
             var resourceHandlers = this.mcpServer.GetRegisteredResourceHandlers();
             var enabledCount = 0;
             foreach (var handler in resourceHandlers)
@@ -275,17 +236,15 @@ namespace UnityMCP.Editor.Settings
                 return;
             }
 
-            // Group resource handlers by assembly
-            var handlersByAssembly = new Dictionary<string, List<KeyValuePair<string, McpServer.ResourceHandlerRegistration>>>();
+            var handlersByAssembly = new Dictionary<string, List<KeyValuePair<string, McpHttpServer.ResourceHandlerRegistration>>>();
 
             foreach (var handler in resourceHandlers)
             {
                 var assemblyName = handler.Value.AssemblyName;
                 if (!handlersByAssembly.ContainsKey(assemblyName))
                 {
-                    handlersByAssembly[assemblyName] = new List<KeyValuePair<string, McpServer.ResourceHandlerRegistration>>();
+                    handlersByAssembly[assemblyName] = new List<KeyValuePair<string, McpHttpServer.ResourceHandlerRegistration>>();
                 }
-
                 handlersByAssembly[assemblyName].Add(handler);
             }
 
@@ -298,30 +257,22 @@ namespace UnityMCP.Editor.Settings
                 {
                     EditorGUILayout.BeginHorizontal(GUILayout.Height(24));
 
-                    // Toggle for enabling/disabling
                     var enabled = handler.Value.Enabled;
                     var newEnabled = EditorGUILayout.Toggle(enabled, GUILayout.Width(20));
-
                     if (enabled != newEnabled)
                     {
                         this.mcpServer.SetResourceHandlerEnabled(handler.Key, newEnabled);
                     }
 
-                    // Display enabled/disabled icon
                     GUILayout.Label(enabled ? this.enabledIcon : this.disabledIcon, GUILayout.Width(20));
-
-                    // Resource name
                     EditorGUILayout.LabelField(handler.Key, GUILayout.Width(120));
 
-                    // URI in a different color
-                    var handler_obj = handler.Value.Handler;
-                    var resourceUri = handler_obj.ResourceUri;
+                    var resourceUri = handler.Value.Handler.ResourceUri;
                     var oldColor = GUI.contentColor;
                     GUI.contentColor = new Color(0.4f, 0.8f, 1.0f);
                     EditorGUILayout.LabelField(resourceUri, GUILayout.Width(150));
                     GUI.contentColor = oldColor;
 
-                    // Description
                     EditorGUILayout.LabelField(handler.Value.Description, this.descriptionStyle);
                     EditorGUILayout.EndHorizontal();
                 }
@@ -330,97 +281,71 @@ namespace UnityMCP.Editor.Settings
             EditorGUILayout.EndVertical();
         }
 
-        /// <summary>
-        /// Draws the connection status section of the settings UI.
-        /// With privacy-focused updates.
-        /// </summary>
-        private void DrawConnectionStateSection()
+        private void DrawServerStatusSection()
         {
             EditorGUILayout.BeginVertical(EditorStyles.helpBox);
 
-            GUILayout.Label("Connection Status", this.headerStyle);
+            GUILayout.Label("Server Status", this.headerStyle);
 
             if (this.mcpServer != null)
             {
-                var connected = this.mcpServer.IsConnected;
+                var isRunning = this.mcpServer.IsRunning;
                 EditorGUILayout.BeginHorizontal();
                 GUILayout.Label("Status:", GUILayout.Width(120));
 
                 var oldColor = GUI.color;
-                if (connected)
+                if (isRunning)
                 {
                     GUI.color = Color.green;
-                    GUILayout.Label("● Connected", EditorStyles.boldLabel);
-                }
-                else if (this.mcpServer.IsRunning)
-                {
-                    GUI.color = new Color(1.0f, 0.7f, 0.0f); // Orange
-                    GUILayout.Label("● Connecting...", EditorStyles.boldLabel);
+                    GUILayout.Label($"● Listening on port {this.mcpServer.BoundPort}", EditorStyles.boldLabel);
                 }
                 else
                 {
                     GUI.color = Color.red;
-                    GUILayout.Label("● Disconnected", EditorStyles.boldLabel);
+                    GUILayout.Label("● Stopped", EditorStyles.boldLabel);
                 }
                 GUI.color = oldColor;
                 EditorGUILayout.EndHorizontal();
 
-                // Show Client ID
-                EditorGUILayout.BeginHorizontal();
-                GUILayout.Label("Client ID:", GUILayout.Width(120));
-
-                // Truncate ID for display and add copy button
-                var clientId = this.mcpServer.ClientId;
-                var shortId = clientId.Length > 40 ? clientId.Substring(0, 37) + "..." : clientId;
-                GUILayout.Label(shortId);
-
-                if (GUILayout.Button("Copy", GUILayout.Width(70)))
-                {
-                    EditorGUIUtility.systemCopyBuffer = clientId;
-                }
-                EditorGUILayout.EndHorizontal();
-
-                // Project details - simplified for privacy
+                // Project info
                 EditorGUILayout.BeginHorizontal();
                 GUILayout.Label("Project:", GUILayout.Width(120));
-                GUILayout.Label($"{Application.productName}");
+                GUILayout.Label(Application.productName);
                 EditorGUILayout.EndHorizontal();
 
-                // Unity version
                 EditorGUILayout.BeginHorizontal();
                 GUILayout.Label("Unity Version:", GUILayout.Width(120));
                 GUILayout.Label(Application.unityVersion);
                 EditorGUILayout.EndHorizontal();
 
-                // Connected since timestamp
-                if (connected)
+                if (isRunning)
                 {
                     EditorGUILayout.BeginHorizontal();
-                    GUILayout.Label("Connected Since:", GUILayout.Width(120));
+                    GUILayout.Label("Started Since:", GUILayout.Width(120));
                     GUILayout.Label(this.mcpServer.ConnectedSince.ToString("yyyy-MM-dd HH:mm:ss"));
+                    EditorGUILayout.EndHorizontal();
+
+                    // Endpoint info
+                    EditorGUILayout.BeginHorizontal();
+                    GUILayout.Label("Endpoint:", GUILayout.Width(120));
+                    var endpoint = $"http://127.0.0.1:{this.mcpServer.BoundPort}";
+                    GUILayout.Label(endpoint);
+                    if (GUILayout.Button("Copy", GUILayout.Width(70)))
+                    {
+                        EditorGUIUtility.systemCopyBuffer = endpoint;
+                    }
                     EditorGUILayout.EndHorizontal();
                 }
 
                 EditorGUILayout.Space(10);
 
-                // Connection controls
+                // Controls
                 EditorGUILayout.BeginHorizontal();
 
-                if (connected)
+                if (isRunning)
                 {
-                    // Disconnect button
-                    GUI.backgroundColor = new Color(0.9f, 0.6f, 0.6f); // Light red
-                    if (GUILayout.Button("Disconnect", GUILayout.Height(25)))
-                    {
-                        this.mcpServer.Stop();
-                    }
-                    GUI.backgroundColor = this.defaultBackgroundColor;
-                }
-                else if (this.mcpServer.IsRunning)
-                {
-                    // Cancel connection button
-                    GUI.backgroundColor = new Color(0.9f, 0.8f, 0.5f); // Light yellow
-                    if (GUILayout.Button("Cancel Connection Attempt", GUILayout.Height(25)))
+                    GUI.backgroundColor = new Color(0.9f, 0.6f, 0.6f);
+                    if (GUILayout.Button("Stop Server", GUILayout.Height(25)))
                     {
                         this.mcpServer.Stop();
                     }
@@ -428,9 +353,8 @@ namespace UnityMCP.Editor.Settings
                 }
                 else
                 {
-                    // Connect button
-                    GUI.backgroundColor = new Color(0.6f, 0.9f, 0.6f); // Light green
-                    if (GUILayout.Button("Connect", GUILayout.Height(25)))
+                    GUI.backgroundColor = new Color(0.6f, 0.9f, 0.6f);
+                    if (GUILayout.Button("Start Server", GUILayout.Height(25)))
                     {
                         this.mcpServer.Start();
                     }
@@ -441,14 +365,12 @@ namespace UnityMCP.Editor.Settings
             }
             else
             {
-                EditorGUILayout.HelpBox("MCP client not initialized", MessageType.Warning);
+                EditorGUILayout.HelpBox("MCP HTTP server not initialized", MessageType.Warning);
 
-                // Initialize button
-                if (GUILayout.Button("Initialize MCP Client"))
+                if (GUILayout.Button("Initialize MCP Server"))
                 {
-                    // Create and register the client
-                    this.mcpServer = new McpServer();
-                    McpServiceManager.Instance.RegisterService<McpServer>(this.mcpServer);
+                    this.mcpServer = new McpHttpServer();
+                    McpServiceManager.Instance.RegisterService(this.mcpServer);
                 }
             }
 

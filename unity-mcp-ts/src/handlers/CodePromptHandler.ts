@@ -1,27 +1,39 @@
 import { BasePromptHandler } from "../core/BasePromptHandler.js";
+import { IMcpPromptDefinition } from "../core/interfaces/IPromptHandler.js";
+import { UnityConnection } from "../core/UnityConnection.js";
+
 /**
- * Prompt handler providing templates for code execution in Unity.
+ * Built-in MCP prompt handler providing templates for Unity C# code execution.
+ *
+ * Placed in `src/handlers/` (not `src/prompts/`) so that the existing
+ * {@link HandlerDiscovery} scan picks it up and registers it via
+ * `PromptRegistry` + `HandlerAdapter.registerPromptHandler`.
+ *
+ * Template text ported verbatim from the legacy Samples~ JS version
+ * (UnityMCPHandlerSamplesJS/CodePromptHandler.js) — see requirements R2.2.
  */
 export class CodePromptHandler extends BasePromptHandler {
     /**
      * Gets the prompt handler name.
      */
-    get promptName() {
+    public get promptName(): string {
         return "code";
     }
+
     /**
      * Gets the description of this prompt handler.
      */
-    get description() {
-        return "Provides templates for C# code execution in Unity";
+    public get description(): string {
+        return "Templates for Unity C# code execution";
     }
+
     /**
      * Gets the prompt definitions supported by this handler.
      * @returns A map of prompt names to their definitions.
      */
-    getPromptDefinitions() {
-        const prompts = new Map();
-        // Add code execution prompt template
+    public getPromptDefinitions(): Map<string, IMcpPromptDefinition> {
+        const prompts = new Map<string, IMcpPromptDefinition>();
+
         prompts.set("code_execute", {
             description: "C# code template for Unity code execution",
             template: `Write C# code that follows these format guidelines to ensure proper execution in Unity:
@@ -38,7 +50,7 @@ Example valid code:
 var activeObjects = GameObject.FindObjectsOfType<GameObject>()
     .Where(go => go.activeInHierarchy)
     .ToList();
-    
+
 Debug.Log($"Found {activeObjects.Count} active GameObjects");
 foreach (var obj in activeObjects.Take(5)) {
     Debug.Log($"Object: {obj.name}");
@@ -65,15 +77,17 @@ namespace CodeExecutionContainer
             return null;
         }
     }
-}`
+}`,
         });
+
         return prompts;
     }
+
     /**
      * Initialize the handler.
      * @param unityConnection The Unity connection.
      */
-    initialize(unityConnection) {
+    public initialize(unityConnection: UnityConnection): void {
         super.initialize(unityConnection);
     }
 }

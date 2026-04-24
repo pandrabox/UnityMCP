@@ -22,6 +22,11 @@ namespace UnityMCP.Editor.Handlers
         public string Description => "Executes Unity Editor menu items (Built-in)";
 
         /// <summary>
+        /// Gets the idempotency classification. Unsafe because menu item execution has side effects.
+        /// </summary>
+        public McpIdempotency Idempotency => McpIdempotency.Unsafe;
+
+        /// <summary>
         /// Executes the command with the given parameters.
         /// </summary>
         /// <param name="action">The action to execute.</param>
