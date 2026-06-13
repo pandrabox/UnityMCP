@@ -85,10 +85,12 @@ export class CodeExecutorHandler extends BaseCommandHandler {
 
         tools.set("unity_execute_code", {
             description:
-                "Execute C# code directly in the Unity Editor context. " +
-                "The code is wrapped in a method body; use `return <expr>;` " +
-                "to surface a value. Use the `code_execute` prompt for the " +
-                "correct code template.",
+                "Execute C# code directly in the Unity Editor context using Roslyn (runtime compilation). " +
+                "The code is wrapped in a method body; use `return <expr>;` to surface a value. " +
+                "IMPORTANT: This tool compiles and runs an ad-hoc snippet — it does NOT compile " +
+                "project .cs files. If you created or edited .cs project files, call compile_scripts " +
+                "first so Unity loads the updated assemblies before you reference them here. " +
+                "Use the `code_execute` prompt for the correct code template.",
             parameterSchema: {
                 code: z
                     .string()
